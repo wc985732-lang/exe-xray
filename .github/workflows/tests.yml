@@ -74,3 +74,107 @@ jobs:
                           offenders.append(f"{path}: {mod}")
           print("third-party imports:", offenders or "none")
           sys.exit(1 if offenders else 0)
+
+  # Packaging is verified once, not ten times: the matrix above already proves the
+  # code runs on both operating systems and every supported interpreter. This job
+  # answers a different question — "would `pip install exe-xray` work for someone
+  # who is not standing in this checkout?"
+  package:
+    name: build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The `dev` extra exists for exactly this: reproducible release tooling,
+      # without adding a runtime dependency to the package itself.
+      - name: Install the package with its release tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+
+      - name: Build sdist and wheel
+        run: python -m build --sdist --wheel
+
+      - name: Validate metadata and long description
+        run: python -m twine check dist/*
+
+      - name: Wheel contains the package and nothing else
+        shell: python
+        run: |
+          import glob, pathlib, sys, zipfile
+
+          wheel = glob.glob("dist/*.whl")
+          assert len(wheel) == 1, f"expected exactly one wheel, found {wheel}"
+          names = set(zipfile.ZipFile(wheel[0]).namelist())
+
+          required = {
+              "exe_xray/__init__.py", "exe_xray/__main__.py", "exe_xray/cli.py",
+              "exe_xray/analyze.py", "exe_xray/pe.py", "exe_xray/der.py",
+              "exe_xray/authenticode.py", "exe_xray/strings.py",
+              "exe_xray/capabilities.py", "exe_xray/report.py",
+          }
+          missing = sorted(required - names)
+          assert not missing, f"wheel is missing modules: {missing}"
+
+          # Tests, notes and fixtures are repository material, not install content.
+          stray = sorted(
+              n for n in names
+              if n.startswith(("tests/", "dist/"))
+              or (n.endswith((".exe", ".md", ".txt")) and "dist-info" not in n)
+          )
+          assert not stray, f"wheel carries files it should not: {stray}"
+
+          entry_points = [n for n in names if n.endswith("entry_points.txt")]
+          assert entry_points, "wheel has no entry_points.txt"
+          declared = zipfile.ZipFile(wheel[0]).read(entry_points[0]).decode()
+          assert "exe-xray = exe_xray.cli:main" in declared, declared
+          print(f"wheel ok: {len(names)} entries, "
+                f"{len(required)} modules, console script declared")
+
+      # The wheel was built by an isolated setuptools, in a clean venv, from the
+      # wheel file alone: no checkout on sys.path, no editable install to hide a
+      # missing module.
+      - name: The built wheel installs into an empty environment and runs
+        run: |
+          python -m venv "$RUNNER_TEMP/from-wheel"
+          WHEEL_PY="$RUNNER_TEMP/from-wheel/bin/python"
+          "$WHEEL_PY" -m pip install --quiet --upgrade pip
+          "$WHEEL_PY" -m pip install --quiet dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/from-wheel/bin/exe-xray" --version
+          "$WHEEL_PY" -c "import exe_xray, sys; print('installed at', exe_xray.__file__); assert 'site-packages' in exe_xray.__file__"
+          "$WHEEL_PY" -c "import exe_xray; print('VERSION', exe_xray.VERSION)"
+
+      # An sdist that cannot rebuild the wheel is a broken release, so it gets the
+      # same treatment rather than a "looks fine" glance.
+      - name: The sdist rebuilds into a working install
+        run: |
+          python -m venv "$RUNNER_TEMP/from-sdist"
+          SDIST_PY="$RUNNER_TEMP/from-sdist/bin/python"
+          "$SDIST_PY" -m pip install --quiet --upgrade pip
+          "$SDIST_PY" -m pip install --quiet dist/*.tar.gz
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/from-sdist/bin/exe-xray" --version
+
+      - name: Documented entry point works from the installed copy
+        run: |
+          python tests/make_fixtures.py
+          cd "$RUNNER_TEMP"
+          # `python -m exe_xray` and the console script are separate entry points;
+          # both are documented, so both are exercised.
+          "$RUNNER_TEMP/from-wheel/bin/exe-xray" "$GITHUB_WORKSPACE/tests/fixtures/suspicious.exe" --compact
+          "$RUNNER_TEMP/from-wheel/bin/python" -m exe_xray "$GITHUB_WORKSPACE/tests/fixtures/clean.exe" --compact
+
+      - name: Keep the artifacts reviewable
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+

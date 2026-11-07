@@ -10,15 +10,46 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "exe-xray contributors" }]
-keywords = ["pe", "pefile", "malware-analysis", "triaging", "windows", "reverse-engineering"]
+keywords = [
+    "pe",
+    "pefile",
+    "malware-analysis",
+    "triaging",
+    "windows",
+    "reverse-engineering",
+    "static-analysis",
+    "cli",
+]
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Security",
-    "Environment :: Console",
+    "Topic :: Software Development :: Disassemblers",
 ]
 dependencies = []
+
+[project.optional-dependencies]
+# Runtime dependencies stay empty on purpose: the analyzer is standard library
+# only, so `pip install exe-xray` must add nothing to the user's environment.
+# This extra exists only to make a release reproducible on a developer machine.
+dev = ["build>=1.2", "twine>=5.0"]
+
+[project.urls]
+Homepage = "https://github.com/wc985732-lang/exe-xray"
+Repository = "https://github.com/wc985732-lang/exe-xray"
+Issues = "https://github.com/wc985732-lang/exe-xray/issues"
+Changelog = "https://github.com/wc985732-lang/exe-xray/blob/main/CHANGELOG.md"
 
 [project.scripts]
 exe-xray = "exe_xray.cli:main"

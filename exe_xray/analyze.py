@@ -11,6 +11,7 @@ import hashlib
 import math
 import os
 import re
+import struct
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
@@ -136,6 +137,80 @@ WINDOWS_COMPONENT_DIRS = ("system32", "syswow64", "winsxs")
 
 
 # --------------------------------------------------------------------------- #
+# managed (.NET) protection weights
+# --------------------------------------------------------------------------- #
+#
+# The packing score above deliberately excludes managed images: IL is
+# high-entropy by construction, a framework image imports one function, and a
+# self-unpacking stub's structural marks are all *normal* for a CLR image. That
+# exclusion is correct and it leaves a hole, because the protectors that matter
+# for .NET (ConfuserEx, .NET Reactor, Eazfuscator, Dotfuscator, Obfuscar) do not
+# touch the PE header at all -- they rewrite the CLR metadata. So the header
+# stays innocent and the image scores zero.
+#
+# These rules read the metadata instead, and they use the same three tiers as
+# the packer table, for the same reason: a signal that legitimate images also
+# produce must never be able to decide on its own.
+#
+# identity      a name only that tool emits. ConfuserEx injects a custom
+#               attribute literally called 'ConfusedBy'; .NET Reactor signs its
+#               stub with 'Eziriz'. Nothing else writes those.
+# structure     a property a compiler cannot produce: identifiers containing
+#               control characters, an embedded managed resource that is not a
+#               .NET resource stream, a metadata table whose own method bodies
+#               do not resolve. Baseline measured over 2 995 managed images on
+#               this host (NOTES-dotnet.md): zero occurrences of each.
+# corroboration measured to overlap with legitimate output (ReadyToRun images
+#               and obfuscated-but-honest assemblies both push these numbers up),
+#               so they can only tip a score that already has structure.
+
+MANAGED_IDENTITY_EVIDENCE = 60      # the protector's own name in the metadata
+MANAGED_RENAME_EVIDENCE = 30        # identifiers full of control characters
+MANAGED_METADATA_EVIDENCE = 30      # method bodies the metadata itself cannot address
+MANAGED_RESOURCE_EVIDENCE = 10      # embedded resource that is not a .NET resource
+MANAGED_IL_ENTROPY_EVIDENCE = 15    # IL bytes that cannot be IL
+MANAGED_STRING_ENTROPY_EVIDENCE = 15  # user-string heap that cannot be text
+MANAGED_STRINGS_STRIPPED_EVIDENCE = 10  # code but not one string literal
+
+# Marker strings, as (needle, family). These are literal identifiers emitted by
+# the tools themselves; they are matched in UTF-8 and UTF-16LE because both a
+# metadata string heap and a native stub can carry them.
+MANAGED_MARKERS = (
+    (b"ConfusedBy", "ConfuserEx"),
+    (b"ConfuserEx", "ConfuserEx"),
+    (b"Eziriz", ".NET Reactor"),
+    (b".NET Reactor", ".NET Reactor"),
+    (b"Eazfuscator", "Eazfuscator"),
+    (b"Dotfuscator", "Dotfuscator"),
+    (b"Obfuscar", "Obfuscar"),
+    (b"SmartAssembly", "SmartAssembly"),
+    (b"BabelObfuscator", "Babel"),
+)
+
+# A managed resource stream starts with this magic (BSJB's sibling: the
+# .resources header). Protectors that encrypt resources leave a compressed blob
+# behind, so the payload no longer starts with it.
+DOTNET_RESOURCE_MAGIC = b"\xce\xca\xef\xbe"
+
+# Identifier characters: anything below 0x20 cannot occur in a name a compiler
+# emits. Measured baseline over the host corpus: 0 identifiers in 2 995 images.
+CONTROL_CHAR_CEILING = 0
+
+# Calibrated on this host (NOTES-dotnet.md, section 3):
+#   IL body entropy   clean max 5.85 over 1 153 images -> ceiling 6.6
+#   #US entropy       clean max 5.33 over 1 147 images -> ceiling 6.2
+IL_ENTROPY_CEILING = 6.6
+USER_STRING_ENTROPY_CEILING = 6.2
+
+# Method bodies carry the RVA column at offset 0 of a MethodDef row. Every image
+# measured on this host pads the row two bytes past the ECMA-335 layout, so the
+# width is *measured* per file (the width whose RVAs land in real sections)
+# rather than assumed. Below this share of resolvable RVAs the metadata cannot be
+# trusted to describe its own code, which is itself the finding.
+MDEF_RVA_FLOOR = 0.90
+
+
+# --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 
@@ -213,6 +288,9 @@ def analyze(path: str, *, max_strings: int = 4000, min_string_len: int = 4,
 
     # cross-cutting judgements
     report["packing"] = _packing_verdict(pe, report["pe"]["sections"], report["imports"])
+    report["managed"] = _safe(
+        lambda: _managed_verdict(pe),
+        {"applies": False, "score": 0, "verdict": "not analysed", "reasons": []})
     report["risk"] = _risk(report)
     report["verdict"] = _verdict(report, pe)
     return report
@@ -661,6 +739,542 @@ def _packing_verdict(pe: PE, sections: list[dict[str, Any]],
 
 
 # --------------------------------------------------------------------------- #
+# CLR metadata
+# --------------------------------------------------------------------------- #
+#
+# A read-only walk of the ECMA-335 metadata tables. Nothing is loaded, resolved
+# or executed: the tables are a byte-addressed index into the same buffer the PE
+# parser already holds, and every read is bounds-checked against it.
+#
+# Only the tables this section needs are described, plus the ones that sit before
+# MethodDef (their widths are what locate it) and ManifestResource (0x28).
+
+#: Coded index kinds -> (tagged tables, tag bits). The width is 2 or 4 bytes
+#: depending on whether the largest tagged table can exceed the tag space.
+_CODED_INDEX = {
+    "ResolutionScope": ([0x00, 0x1A, 0x23, 0x01], 2),
+    "TypeDefOrRef": ([0x02, 0x01, 0x1B], 2),
+    "HasConstant": ([0x04, 0x08, 0x17], 2),
+    "HasCustomAttribute": ([0x06, 0x04, 0x01, 0x02, 0x08, 0x09, 0x0A, 0x00, 0x0E,
+                            0x17, 0x14, 0x11, 0x1A, 0x1B, 0x20, 0x23, 0x26, 0x27,
+                            0x28, 0x2A, 0x2C, 0x2B], 5),
+    "HasFieldMarshal": ([0x04, 0x08], 1),
+    "HasDeclSecurity": ([0x02, 0x06, 0x20], 2),
+    "MemberRefParent": ([0x02, 0x01, 0x1A, 0x06, 0x1B], 3),
+    "HasSemantics": ([0x14, 0x17], 1),
+    "MethodDefOrRef": ([0x06, 0x0A], 1),
+    "MemberForwarded": ([0x04, 0x06], 1),
+    "Implementation": ([0x26, 0x23, 0x27], 2),
+    "CustomAttributeType": ([0x00, 0x00, 0x06, 0x0A, 0x00], 3),
+    "TypeOrMethodDef": ([0x02, 0x06], 1),
+}
+
+_U2, _U4, _STR, _GUID, _BLOB = "u2", "u4", "s", "g", "b"
+
+#: Table index -> column layout, for the tables this module reads or must skip.
+_TABLE_COLUMNS: dict[int, list[tuple[str, Any]]] = {
+    0x00: [("Generation", _U2), ("Name", _STR), ("Mvid", _GUID),
+           ("EncId", _GUID), ("EncBaseId", _GUID)],
+    0x01: [("ResolutionScope", ("c", "ResolutionScope")), ("Name", _STR),
+           ("Namespace", _STR)],
+    0x02: [("Flags", _U4), ("Name", _STR), ("Namespace", _STR),
+           ("Extends", ("c", "TypeDefOrRef")), ("FieldList", ("t", 0x04)),
+           ("MethodList", ("t", 0x06))],
+    0x03: [("Field", ("t", 0x04))],
+    0x04: [("Flags", _U2), ("Name", _STR), ("Signature", _BLOB)],
+    0x05: [("Method", ("t", 0x06))],
+    0x06: [("RVA", _U4), ("ImplFlags", _U2), ("Flags", _U2), ("Name", _STR),
+           ("Signature", _BLOB)],
+    0x08: [("Flags", _U2), ("Sequence", _U2), ("Name", _STR)],
+    0x09: [("Class", ("t", 0x02)), ("Interface", ("c", "TypeDefOrRef"))],
+    0x0A: [("Class", ("c", "MemberRefParent")), ("Name", _STR), ("Signature", _BLOB)],
+    0x0B: [("Type", _U2), ("Parent", ("c", "HasConstant")), ("Value", _BLOB)],
+    0x0C: [("Parent", ("c", "HasCustomAttribute")),
+           ("Type", ("c", "CustomAttributeType")), ("Value", _BLOB)],
+    0x0D: [("Parent", ("c", "HasCustomAttribute")), ("Value", _BLOB)],
+    0x0E: [("Action", _U2), ("Parent", ("c", "HasDeclSecurity")),
+           ("PermissionSet", _BLOB)],
+    0x0F: [("PackingSize", _U2), ("ClassSize", _U4), ("Parent", ("t", 0x02))],
+    0x10: [("Offset", _U4), ("Field", ("t", 0x04))],
+    0x11: [("Signature", _BLOB)],
+    0x12: [("Parent", ("t", 0x02)), ("EventList", ("t", 0x14))],
+    0x14: [("EventFlags", _U2), ("Name", _STR), ("EventType", ("c", "TypeDefOrRef"))],
+    0x15: [("Parent", ("t", 0x02)), ("PropertyList", ("t", 0x17))],
+    0x17: [("Flags", _U2), ("Name", _STR), ("Type", _BLOB)],
+    0x18: [("Semantics", _U2), ("Method", ("t", 0x06)),
+           ("Association", ("c", "HasSemantics"))],
+    0x19: [("Class", ("t", 0x02)), ("MethodBody", ("c", "MethodDefOrRef")),
+           ("MethodDeclaration", ("c", "MethodDefOrRef"))],
+    0x1A: [("Name", _STR)],
+    0x1B: [("Signature", _BLOB)],
+    0x1C: [("MappingFlags", _U2), ("MemberForwarded", ("c", "MemberForwarded")),
+           ("ImportName", _STR), ("ImportScope", ("t", 0x1A))],
+    0x1D: [("RVA", _U4), ("Field", ("t", 0x04))],
+    0x20: [("HashAlgId", _U4), ("Major", _U2), ("Minor", _U2), ("Build", _U2),
+           ("Rev", _U2), ("Flags", _U4), ("PublicKey", _BLOB), ("Name", _STR),
+           ("Culture", _STR)],
+    0x23: [("Major", _U2), ("Minor", _U2), ("Build", _U2), ("Rev", _U2),
+           ("Flags", _U4), ("PublicKeyOrToken", _BLOB), ("Name", _STR),
+           ("Culture", _STR), ("HashValue", _BLOB)],
+    0x26: [("Flags", _U4), ("Name", _STR), ("HashValue", _BLOB)],
+    0x27: [("Flags", _U4), ("TypeDefId", _U4), ("TypeName", _STR),
+           ("TypeNamespace", _STR), ("Implementation", ("c", "Implementation"))],
+    0x28: [("Offset", _U4), ("Flags", _U4), ("Name", _STR),
+           ("Implementation", ("c", "Implementation"))],
+    0x29: [("NestedClass", ("t", 0x02)), ("EnclosingClass", ("t", 0x02))],
+    0x2A: [("Number", _U2), ("Flags", _U2), ("Owner", ("c", "TypeOrMethodDef")),
+           ("Name", _STR)],
+    0x2B: [("Method", ("c", "MethodDefOrRef")), ("Instantiation", _BLOB)],
+    0x2C: [("Owner", ("t", 0x2A)), ("Constraint", ("c", "TypeDefOrRef"))],
+}
+
+_MAX_TABLE = 0x2D
+
+
+class _Metadata:
+    """Row addressing for one metadata root. All reads are bounds-checked."""
+
+    def __init__(self, data: bytes, base: int) -> None:
+        self.data = data
+        self.base = base
+        self.streams: dict[str, tuple[int, int]] = {}
+        self.stream_order: list[str] = []
+        if data[base:base + 4] != b"BSJB":
+            raise ValueError("no metadata signature")
+        ver_len = struct.unpack_from("<I", data, base + 12)[0]
+        if not 0 < ver_len <= 512:
+            raise ValueError("implausible version length")
+        p = base + 16 + ver_len
+        _flags, count = struct.unpack_from("<HH", data, p)
+        p += 4
+        for _ in range(min(count, 32)):
+            off, size = struct.unpack_from("<II", data, p)
+            end = data.find(b"\x00", p + 8, p + 40)
+            if end < 0:
+                raise ValueError("unterminated stream name")
+            name = data[p + 8:end].decode("latin-1", "replace")
+            self.streams[name] = (off, size)
+            self.stream_order.append(name)
+            p = p + 8 + ((len(name) + 4) & ~3)
+
+        self.table_stream = next(
+            (t for t in ("#~", "#-") if t in self.streams), "")
+        self.heap_widths = {"s": 2, "g": 2, "b": 2}
+        self.rowcounts: dict[int, int] = {}
+        self.tables: dict[int, tuple[int, int, int]] = {}
+        self.mdef_stride = 0
+        self.mdef_spec = 0
+        if self.table_stream:
+            self._tables()
+
+    # -- table geometry ------------------------------------------------- #
+
+    def _tables(self) -> None:
+        data = self.data
+        off, size = self.streams[self.table_stream]
+        o = self.base + off
+        heap = data[o + 6]
+        self.heap_widths = {"s": 4 if heap & 1 else 2,
+                            "g": 4 if heap & 2 else 2,
+                            "b": 4 if heap & 4 else 2}
+        valid = struct.unpack_from("<Q", data, o + 8)[0]
+        p = o + 24
+        for i in range(_MAX_TABLE):
+            if valid >> i & 1:
+                self.rowcounts[i] = struct.unpack_from("<I", data, p)[0]
+                p += 4
+        self._rowcount_start = p
+        self._build()
+
+    def _col_size(self, kind: Any) -> int:
+        if kind == _U2:
+            return 2
+        if kind == _U4:
+            return 4
+        if kind in self.heap_widths:
+            return self.heap_widths[kind]
+        if kind[0] == "t":
+            return 4 if self.rowcounts.get(kind[1], 0) >= 65536 else 2
+        tables, bits = _CODED_INDEX[kind[1]]
+        widest = max((self.rowcounts.get(t, 0) for t in tables if t), default=0)
+        return 4 if widest >= (1 << (16 - bits)) else 2
+
+    def row_size(self, table: int) -> int:
+        return sum(self._col_size(k) for _n, k in _TABLE_COLUMNS.get(table, ()))
+
+    def _build(self) -> None:
+        self.tables = {}
+        cur = self._rowcount_start
+        for i in range(_MAX_TABLE):
+            rows = self.rowcounts.get(i, 0)
+            if not rows:
+                continue
+            width = self.row_size(i)
+            self.tables[i] = (cur, width, rows)
+            cur += width * rows
+        self.mdef_spec = self.row_size(0x06)
+
+    def rechain(self, mdef_width: int) -> None:
+        self.tables = {}
+        cur = self._rowcount_start
+        for i in range(_MAX_TABLE):
+            rows = self.rowcounts.get(i, 0)
+            if not rows:
+                continue
+            width = mdef_width if i == 0x06 else self.row_size(i)
+            self.tables[i] = (cur, width, rows)
+            cur += width * rows
+        self.mdef_stride = mdef_width
+
+    # -- cells ---------------------------------------------------------- #
+
+    def cell(self, table: int, row: int, column: int) -> int:
+        """Value of column ``column`` in ``row`` of ``table``."""
+        start, width, rows = self.tables[table]
+        if not 0 <= row < rows:
+            return 0
+        p = start + row * width
+        for index, (_name, kind) in enumerate(_TABLE_COLUMNS[table]):
+            if index == column:
+                size = self._col_size(kind)
+                if p + size > len(self.data):
+                    return 0
+                return (struct.unpack_from("<I", self.data, p)[0] if size == 4
+                        else struct.unpack_from("<H", self.data, p)[0])
+            p += self._col_size(kind)
+        return 0
+
+    def string(self, index: int) -> str:
+        if "#Strings" not in self.streams:
+            return ""
+        off, size = self.streams["#Strings"]
+        if not 0 <= index < size:
+            return ""
+        start = self.base + off + index
+        end = self.data.find(b"\x00", start, self.base + off + size)
+        if end < 0:
+            end = self.base + off + size
+        return self.data[start:end].decode("utf-8", "replace")
+
+    def heap(self, name: str) -> bytes:
+        if name not in self.streams:
+            return b""
+        off, size = self.streams[name]
+        return self.data[self.base + off: self.base + off + size]
+
+
+def _rva_resolves(pe: PE, rva: int) -> bool:
+    return rva == 0 or pe.rva_to_offset_safe(rva) is not None
+
+
+def _measure_mdef_width(pe: PE, md: _Metadata) -> tuple[int, float]:
+    """Choose the MethodDef row width whose RVA column lands in real sections.
+
+    ECMA-335 fixes this width, but every managed image measured on this host
+    carries two bytes more than the specification says (NOTES-dotnet.md §2), and
+    the wrong choice turns a method table into noise. Trusting the file over the
+    document is the only way to read both kinds of image, and the share of
+    resolvable RVAs -- returned here -- says whether either choice worked.
+    """
+    start, spec, rows = md.tables[0x06]
+    data = md.data
+    probe = list(range(0, min(rows, 300)))
+    if rows > 300:
+        probe += list(range(0, rows, max(1, rows // 300)))[:300]
+    best_width, best_score, best_share = spec, -1, 0.0
+    for width in (spec, spec + 2, spec + 4):
+        hits = 0
+        for row in probe:
+            p = start + row * width
+            if p + 4 > len(data):
+                continue
+            if _rva_resolves(pe, struct.unpack_from("<I", data, p)[0]):
+                hits += 1
+        if hits > best_score:
+            best_width, best_score = width, hits
+    good = 0
+    for row in range(rows):
+        p = start + row * best_width
+        if p + 4 > len(data):
+            break
+        if _rva_resolves(pe, struct.unpack_from("<I", data, p)[0]):
+            good += 1
+    if rows:
+        best_share = good / rows
+    return best_width, best_share
+
+
+def _clr_metadata(pe: PE) -> dict[str, Any]:
+    """Parse what the managed-protection rules need, or explain why not."""
+    data = pe.data
+    rva, _size = pe.dir(14)
+    if not rva:
+        return {"present": False}
+    header = pe.rva_to_offset_safe(rva)
+    if header is None or header + 72 > len(data):
+        return {"present": True, "error": "CLR header points outside the file"}
+    md_rva, md_size = struct.unpack_from("<II", data, header + 8)
+    res_rva = struct.unpack_from("<I", data, header + 24)[0]
+    base = pe.rva_to_offset_safe(md_rva) if md_rva and md_size else None
+    if base is None:
+        return {"present": True, "error": "metadata root points outside the file"}
+
+    facts: dict[str, Any] = {"present": True}
+    try:
+        md = _Metadata(data, base)
+    except (ValueError, struct.error, IndexError) as exc:
+        facts["error"] = f"metadata root unreadable: {exc}"
+        return facts
+
+    facts["streams"] = {n: md.streams[n][1] for n in md.stream_order}
+    facts["table_stream"] = md.table_stream
+    facts["module"] = md.string(md.cell(0x00, 0, 1)) if 0x00 in md.tables else ""
+
+    # -- method bodies --------------------------------------------------- #
+    facts["methods"] = 0
+    facts["rva_share"] = 1.0
+    if 0x06 in md.tables:
+        width, share = _measure_mdef_width(pe, md)
+        md.rechain(width)
+        facts["mdef_width"] = width
+        facts["mdef_spec_width"] = md.mdef_spec
+        facts["rva_share"] = round(share, 4)
+        start, step, rows = md.tables[0x06]
+        facts["methods"] = rows
+        sizes: list[int] = []
+        il_chunks: list[bytes] = []
+        for row in range(rows):
+            p = start + row * step
+            if p + 4 > len(data):
+                break
+            method_rva = struct.unpack_from("<I", data, p)[0]
+            if not method_rva:
+                continue
+            body = pe.rva_to_offset_safe(method_rva)
+            if body is None or body + 1 >= len(data):
+                continue
+            first = data[body]
+            if first & 3 == 2:                     # tiny header
+                size = first >> 2
+                sizes.append(size)
+                if len(il_chunks) < 400:
+                    il_chunks.append(data[body + 1:body + 1 + size])
+            elif first & 3 == 3:                   # fat header
+                if body + 8 > len(data):
+                    continue
+                flags = struct.unpack_from("<H", data, body)[0]
+                header_bytes = (flags >> 12) * 4
+                code_size = struct.unpack_from("<I", data, body + 4)[0]
+                if 0 < header_bytes <= 12 and 0 < code_size < (1 << 22):
+                    sizes.append(code_size)
+                    if len(il_chunks) < 400:
+                        il_chunks.append(
+                            data[body + header_bytes: body + header_bytes + code_size])
+        facts["bodies"] = len(sizes)
+        facts["il_entropy"] = (round(entropy(b"".join(il_chunks)), 3)
+                               if il_chunks else None)
+
+    # -- identifiers ------------------------------------------------------ #
+    names: list[str] = []
+    if 0x02 in md.tables:
+        _s, _w, typedef_rows = md.tables[0x02]
+        for row in range(typedef_rows):
+            names.append(md.string(md.cell(0x02, row, 1)))
+    if 0x06 in md.tables:
+        _s, _w, method_rows = md.tables[0x06]
+        for row in range(min(method_rows, 2000)):
+            names.append(md.string(md.cell(0x06, row, 3)))
+    names = [n for n in names if n]
+    facts["identifiers"] = len(names)
+    facts["identifiers_control"] = sum(
+        1 for n in names if any(ord(ch) < 0x20 for ch in n))
+    facts["identifiers_unprintable"] = sum(
+        1 for n in names if any(not 0x20 <= ord(ch) <= 0x7E for ch in n))
+
+    # -- user strings ------------------------------------------------------ #
+    us = md.heap("#US")
+    facts["us_present"] = "#US" in md.streams
+    facts["us_size"] = len(us)
+    facts["us_entropy"] = round(entropy(us), 3) if us else 0.0
+
+    # -- embedded resources ------------------------------------------------ #
+    facts["resources"] = []
+    res_base = pe.rva_to_offset_safe(res_rva) if res_rva else None
+    if res_base is not None and 0x28 in md.tables:
+        _s, _w, rows = md.tables[0x28]
+        for row in range(min(rows, 64)):
+            offset = md.cell(0x28, row, 0)
+            if md.cell(0x28, row, 3):          # implemented elsewhere (linked)
+                continue
+            p = res_base + offset
+            if p + 8 > len(data):
+                continue
+            payload = data[p + 4: p + 8]
+            facts["resources"].append({
+                "name": md.string(md.cell(0x28, row, 2)),
+                "magic": ("resources" if payload == DOTNET_RESOURCE_MAGIC
+                          else "zip" if payload[:2] == b"PK"
+                          else "xml" if payload[:1] == b"<"
+                          or payload == b"\xef\xbb\xbf<"
+                          else "unrecognised"),
+            })
+    return facts
+
+
+# --------------------------------------------------------------------------- #
+# managed protection verdict
+# --------------------------------------------------------------------------- #
+
+def _managed_marker_families(data: bytes) -> list[str]:
+    """Protector names found in the file, as UTF-8 or UTF-16LE."""
+    found: list[str] = []
+    for needle, family in MANAGED_MARKERS:
+        if family in found:
+            continue
+        wide = needle.decode("ascii").encode("utf-16-le")
+        if needle in data or wide in data:
+            found.append(family)
+    return found
+
+
+def _managed_verdict(pe: PE) -> dict[str, Any]:
+    """Score a managed image for protector marks, or say it is clean.
+
+    The packing score deliberately exempts managed images because the CLR
+    convention makes its structural numbers meaningless. The exemption is right;
+    what it left behind was a claim, made by omission, that nothing about a
+    managed image can be judged. These rules judge the metadata instead, and they
+    stay quiet on a clean assembly because every one of them is a property a
+    compiler does not produce -- measured, not assumed (NOTES-dotnet.md).
+    """
+    try:
+        clr = _clr_metadata(pe)
+    except Exception as exc:      # one broken facet must not kill the report
+        clr = {"present": True, "error": f"{type(exc).__name__}: {exc}"}
+    if not clr.get("present"):
+        return {"applies": False, "score": 0,
+                "verdict": "not a managed image", "reasons": []}
+
+    score = 0
+    reasons: list[str] = []
+    structural = 0
+    identity = False
+
+    if clr.get("error"):
+        reasons.append(f"the CLR metadata could not be read ({clr['error']}): no "
+                       f"managed-protection judgement is possible from this file")
+        return {"applies": True, "score": 0, "verdict": "managed metadata unreadable",
+                "reasons": reasons}
+
+    # -- identity: the protector named itself ---------------------------- #
+    families = _managed_marker_families(pe.data)
+    if families:
+        score += MANAGED_IDENTITY_EVIDENCE
+        identity = True
+        reasons.append(
+            f"the file contains the name(s) {', '.join(families)}: these are the "
+            f"protector's own identifiers, which no compiler emits")
+
+    # -- structure: what a compiler cannot produce ----------------------- #
+    identifiers = clr.get("identifiers", 0)
+    control = clr.get("identifiers_control", 0)
+    if identifiers >= 10 and control >= 5 and control / identifiers >= 0.02:
+        score += MANAGED_RENAME_EVIDENCE
+        structural += 1
+        reasons.append(
+            f"{control} of {identifiers} type and method names contain control "
+            f"characters: a renamer wrote those, a compiler cannot")
+
+    share = clr.get("rva_share", 1.0)
+    methods = clr.get("methods", 0)
+    if methods >= 20 and share < MDEF_RVA_FLOOR:
+        score += MANAGED_METADATA_EVIDENCE
+        structural += 1
+        reasons.append(
+            f"only {share:.0%} of the {methods} method bodies are located by the "
+            f"metadata's own RVA column: the table does not describe this image")
+
+    odd_resources = [r for r in clr.get("resources", [])
+                     if r.get("magic") == "unrecognised"]
+    if odd_resources:
+        # Demoted to corroboration after the corpus contradicted the first draft:
+        # System.Text.Encoding.CodePages.dll ships 'codepages.nlp', a plain data
+        # file that is not a .NET resource stream, and it is not protected. An
+        # assembly may embed any bytes it likes, so "not a .NET resource" says
+        # nothing on its own; it only means the blob was compressed or encrypted
+        # *if* the rest of the evidence already points that way.
+        score += MANAGED_RESOURCE_EVIDENCE
+        name = odd_resources[0].get("name") or "<unnamed>"
+        reasons.append(
+            f"embedded resource {name!r} does not start with the .NET resource "
+            f"magic: either data the program genuinely embeds, or a resource "
+            f"stream that was compressed or encrypted at rest")
+
+    # -- corroboration: overlaps with legitimate output ------------------ #
+    il_entropy = clr.get("il_entropy")
+    bodies = clr.get("bodies", 0)
+    if il_entropy is not None and bodies >= 20 and il_entropy > IL_ENTROPY_CEILING:
+        score += MANAGED_IL_ENTROPY_EVIDENCE
+        reasons.append(
+            f"the {bodies} method bodies reach {il_entropy:.2f} bits/byte, above the "
+            f"{IL_ENTROPY_CEILING} ceiling measured for compiler output on this host")
+
+    us_entropy = clr.get("us_entropy", 0.0)
+    if clr.get("us_present") and clr.get("us_size", 0) > 64 \
+            and us_entropy > USER_STRING_ENTROPY_CEILING:
+        score += MANAGED_STRING_ENTROPY_EVIDENCE
+        reasons.append(
+            f"the user-string heap has entropy {us_entropy:.2f} bits/byte "
+            f"(ceiling {USER_STRING_ENTROPY_CEILING}): it holds ciphertext, not text")
+
+    if not clr.get("us_present") and methods >= 200:
+        score += MANAGED_STRINGS_STRIPPED_EVIDENCE
+        reasons.append(
+            f"{methods} methods and not one string literal in the image: string "
+            f"encryption moves literals out of #US (weak evidence on its own, "
+            f"because facade assemblies also ship without a string heap)")
+
+    score = min(score, 100)
+    decided = bool(identity or structural)
+    if not decided:
+        # Corroboration only, so the honest report is "nothing found" -- and a
+        # score above zero would contradict that verdict in the same breath. The
+        # clean corpus decided this: a plain .NET assembly reaches 25 on embedded
+        # data and high-entropy IL alone, and every clean image must read as
+        # untouched (NOTES-dotnet.md §4).
+        if score:
+            reasons.append(
+                "the signals above are corroborating only; nothing structural was "
+                "found, so this image is not called protected")
+        score = 0
+
+    if not decided:
+        verdict = "no managed protection indicators"
+    elif score >= LIKELY_PACKED:
+        verdict = "likely managed protection"
+    elif score >= POSSIBLY_PACKED:
+        verdict = "possibly managed protection"
+    else:
+        verdict = "no managed protection indicators"
+
+    return {
+        "applies": True,
+        "score": score,
+        "verdict": verdict,
+        "family": families[0] if families else "",
+        "streams": sorted(clr.get("streams") or {}),
+        "methods": methods,
+        "identifiers": identifiers,
+        "identifiers_control": control,
+        "rva_share": share,
+        "mdef_width": clr.get("mdef_width"),
+        "il_entropy": il_entropy,
+        "resource_kinds": sorted({r.get("magic", "") for r in clr.get("resources", [])}),
+        "reasons": reasons[:10],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # risk + verdict
 # --------------------------------------------------------------------------- #
 
@@ -796,6 +1410,17 @@ def _risk(report: dict[str, Any]) -> dict[str, Any]:
             "of what the program can do")
         score += 35
 
+    managed = report.get("managed") or {}
+    if managed.get("score", 0) >= 60:
+        # A managed protector rewrites the metadata the analysis above reads
+        # (names, literals, method bodies), so the capability picture is no more
+        # complete than it is for a packed native image -- but it is also no less
+        # certain, because the CLR header is still there to be parsed.
+        add("managed-protected", "warn",
+            "this managed assembly is protected, so the type and method names above "
+            "are whatever the protector chose to keep")
+        score += 25
+
     exports = report.get("pe", {}).get("exports", {}).get("count", 0)
     if report.get("pe", {}).get("kind") == "DLL" and exports >= 25:
         add("library-image", "note",
@@ -930,5 +1555,8 @@ def _verdict(report: dict[str, Any], pe: PE) -> dict[str, str]:
     summary += f"Risk: {report['risk']['level']} ({report['risk']['score']}/100)."
     if report["packing"]["score"] >= 30:
         summary += f" Packing: {report['packing']['verdict']}."
+    managed = report.get("managed") or {}
+    if managed.get("score", 0) >= 30:
+        summary += f" Managed protection: {managed['verdict']}."
 
     return {"kind": head, "summary": summary}

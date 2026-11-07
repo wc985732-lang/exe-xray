@@ -2,6 +2,8 @@
 
 [![tests](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml/badge.svg)](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml)
 
+English | [简体中文](README.zh-CN.md)
+
 A static, human-readable health check for Windows executables.
 
 Point it at an `.exe` or `.dll` and get back a plain-English report: what kind of
@@ -440,7 +442,7 @@ products, not checked-in samples, so a fresh clone has no `tests/fixtures/` unti
 the test command above has run once. `python tests/make_fixtures.py` does the
 same without running the tests.
 
-67 tests cover header parsing, import classification, string buckets, packing,
+95 tests cover header parsing, import classification, string buckets, packing,
 risk scoring, error handling, both renderers, the CLI exit codes, the batch
 checksum against the old byte-loop oracle, the `--no-checksum` report marker,
 `--batch` (recursive discovery, extension filter, globs, `--max-files`,
