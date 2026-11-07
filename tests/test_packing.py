@@ -34,6 +34,26 @@ from exe_xray.analyze import analyze  # noqa: E402
 FIXTURES = os.path.join(HERE, "fixtures")
 VERDICTS = {"no packing indicators", "possibly packed", "likely packed / protected"}
 
+
+def setUpModule() -> None:
+    """Materialise the on-disk fixtures this module reads.
+
+    ``test_xray`` writes the same files in its own ``setUpModule``, but unittest
+    gives no ordering guarantee between modules, and the fixtures are gitignored
+    (generated on demand). A fresh clone therefore has an empty ``tests/fixtures``
+    when this module starts — which is exactly what CI hit while a developer
+    machine, with leftovers from previous runs, passed. Generating them here makes
+    the module self-sufficient.
+    """
+    os.makedirs(FIXTURES, exist_ok=True)
+    for name, blob in (("clean.exe", make_fixtures.clean_exe()),
+                       ("packed.exe", make_fixtures.packed_exe()),
+                       ("suspicious.exe", make_fixtures.suspicious_exe())):
+        path = os.path.join(FIXTURES, name)
+        if not os.path.exists(path):
+            with open(path, "wb") as fh:
+                fh.write(blob)
+
 # Real images used as ground truth. The three packers were found by scanning this
 # host for packer section names; the controls are stock components whose
 # innocence is established by their signature and their role, not by a guess.
