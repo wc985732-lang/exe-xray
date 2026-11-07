@@ -7,3 +7,8 @@ dist/
 # test fixtures are generated on demand (tests/make_fixtures.py, run by
 # unittest's setUpModule); generated binaries are not checked in
 tests/fixtures/
+
+# never commit credentials
+.github-token
+*token.txt
+.env
