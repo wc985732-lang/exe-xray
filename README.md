@@ -1,5 +1,7 @@
 # exe-xray
 
+[![tests](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml/badge.svg)](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml)
+
 A static, human-readable health check for Windows executables.
 
 Point it at an `.exe` or `.dll` and get back a plain-English report: what kind of
