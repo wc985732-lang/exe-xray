@@ -760,5 +760,33 @@ class TestToolingTokens(unittest.TestCase):
         self.assertNotIn("tooling", buckets)
 
 
+class TestPackaging(unittest.TestCase):
+    """The version string exists in two places, and they drifted once already.
+
+    ``pyproject.toml`` decides what PyPI and ``pip`` call this release;
+    ``exe_xray.__version__`` decides what ``exe-xray --version`` prints. Nothing
+    compared them, so a release could be labelled 0.2.0 on PyPI while the binary
+    still announced 0.1.0. This is the cheapest possible guard against that.
+    """
+
+    def test_declared_version_matches_the_code(self) -> None:
+        path = os.path.join(ROOT, "pyproject.toml")
+        declared = None
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if stripped.startswith("version") and "=" in stripped:
+                    declared = stripped.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        self.assertIsNotNone(declared, "pyproject.toml must declare a version")
+
+        from exe_xray import VERSION, __version__
+
+        self.assertEqual(
+            declared, __version__,
+            f"pyproject.toml says {declared}, exe_xray says {__version__}")
+        self.assertEqual(VERSION, __version__)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

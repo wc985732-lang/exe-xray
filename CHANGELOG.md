@@ -14,6 +14,29 @@ listed here as `Changed`, never slipped in silently.
 
 Nothing yet.
 
+## [0.1.1] - 2026-11-07
+
+A documentation release. The code is byte-identical to 0.1.0; the package page
+was saying the wrong thing.
+
+### Fixed
+
+- The Install section read `pip install .`, which is an instruction for someone
+  standing inside a checkout — not for anyone arriving from PyPI. It now reads
+  `pip install exe-xray`, with the checkout route kept as the alternative.
+- Three links in the long description (`README.zh-CN.md`, `NOTES-packing.md`,
+  `LICENSE`) were repository-relative and returned 404 on PyPI, where the
+  description is rendered outside the repository. They are absolute now.
+
+### Added
+
+- `NOTES-dotnet.md`, the provenance document that `analyze.py` had been citing
+  five times, by section number, without it existing.
+- `MANIFEST.in`: the sdist now ships `tests/` together with the
+  `make_fixtures.py` those tests import, and excludes the generated fixtures.
+- A test asserting that the version in `pyproject.toml` and the one in
+  `exe_xray/__init__.py` agree. They had drifted apart with nothing to catch it.
+
 ## [0.1.0] - 2026-11-07
 
 First public release. `exe-xray` reads a PE file and writes a report a human can

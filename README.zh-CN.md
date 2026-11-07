@@ -1,6 +1,8 @@
 # exe-xray
 
 [![tests](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml/badge.svg)](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/exe-xray.svg)](https://pypi.org/project/exe-xray/)
+[![Python versions](https://img.shields.io/pypi/pyversions/exe-xray.svg)](https://pypi.org/project/exe-xray/)
 
 [English](README.md) | 简体中文
 
@@ -35,12 +37,17 @@ $ python xray.py C:\Windows\System32\notepad.exe
 
 ## 安装
 
-其实不用装。Python 3.9+：
+```
+pip install exe-xray
+```
+
+就这一条，装完能用。一个 wheel，零依赖，Python 3.9+。
+
+想直接在仓库里跑也行，什么都不用装：
 
 ```
 python xray.py <file>            # 直接在仓库里跑
 python -m exe_xray <file>        # 等价写法
-pip install .                    # 可选：装完就有了 exe-xray 命令
 ```
 
 ## 用法

@@ -1,6 +1,8 @@
 # exe-xray
 
 [![tests](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml/badge.svg)](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/exe-xray.svg)](https://pypi.org/project/exe-xray/)
+[![Python versions](https://img.shields.io/pypi/pyversions/exe-xray.svg)](https://pypi.org/project/exe-xray/)
 
 English | [简体中文](https://github.com/wc985732-lang/exe-xray/blob/main/README.zh-CN.md)
 
@@ -27,12 +29,17 @@ a human can read without knowing what `SetWindowsHookExW` does.
 
 ## Install
 
-Nothing to install. Python 3.9+:
+```
+pip install exe-xray
+```
+
+That is the whole install. One wheel, no dependencies, Python 3.9+.
+
+Prefer to run it straight from a checkout? Nothing needs installing:
 
 ```
 python xray.py <file>            # run from the checkout
 python -m exe_xray <file>        # same thing
-pip install .                    # optional: gives you an `exe-xray` command
 ```
 
 ## Usage
