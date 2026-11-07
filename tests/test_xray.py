@@ -321,13 +321,27 @@ class TestChecksum(unittest.TestCase):
         self.assertEqual(pe.computed_checksum(), self.legacy_checksum(blob, 89))
 
     def test_real_binaries_still_validate(self) -> None:
+        """Checksum agreement against real files that ship with the OS.
+
+        ``sys.executable`` is a PE image on Windows and an ELF image everywhere
+        else, so the specimens are filtered by their own magic rather than by
+        guessing from the platform name. A host that offers no PE specimen is
+        reported as a skip — "not proven here" — never as a pass.
+        """
+        tested = 0
         for path in (NOTEPAD, PYTHON):
             if not os.path.exists(path):
                 continue
+            with open(path, "rb") as handle:
+                if handle.read(2) != b"MZ":
+                    continue
+            tested += 1
             with self.subTest(binary=os.path.basename(path)):
                 report = analyze(path)
                 self.assertTrue(report["pe"]["checksum"]["valid"],
                                 f"{path}: stored checksum no longer matches")
+        if not tested:
+            self.skipTest("no PE-form specimen on this host")
 
     def test_disabled_verification_returns_the_stored_value(self) -> None:
         blob = read_bytes(fixture("clean.exe"))
