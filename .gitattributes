@@ -1,0 +1,8 @@
+# Store text as LF in the repository regardless of the checkout platform, so a
+# Windows working tree and a Linux CI runner produce byte-identical blobs.
+* text=auto eol=lf
+
+*.png binary
+*.gif binary
+*.exe binary
+*.dll binary
