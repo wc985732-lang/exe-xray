@@ -37,6 +37,7 @@ pip install .                    # optional: gives you an `exe-xray` command
 
 ```
 exe-xray FILE [FILE ...] [options]
+exe-xray --batch PATH [batch options]
 
   --json                 full structured report instead of prose
   --compact              one summary line per file
@@ -51,10 +52,22 @@ exe-xray FILE [FILE ...] [options]
   --max-file-mb MB       refuse files above this size (default 512)
   --color {auto,always,never}
   --version
+
+  batch mode:
+  --batch PATH           directory, glob or single file; scanned recursively for
+                         .exe/.dll/.sys/.cpl/.scr/.ocx
+  --max-files N          stop after N files were analysed, in path order (default 500)
+  --min-risk-level LVL   list only minimal|low|medium|high and above (default minimal)
+  --csv                  CSV instead of the table: score,level,name,path,verdict
+  --fail-on-risk N       exit 1 when any listed file scores N/100 or more
 ```
 
-Exit codes: `0` report produced, `1` the file could not be analysed (with the
-reason on stderr), `2` bad arguments.
+Exit codes: `0` at least one report was produced and the `--fail-on-risk` gate (if
+given) did not trip, `1` nothing could be analysed or the gate tripped, `2` bad
+arguments, `130` interrupted (Ctrl+C).
+
+A file that fails to parse is *not* one of those: it is counted in the `errors`
+column of the footer, named on stderr, and the sweep keeps going.
 
 ### Big files
 
@@ -67,6 +80,67 @@ when you only want the imports/strings/verdict.
 ```
 $ python xray.py C:\Windows\System32\MRT.exe --no-checksum --compact
 ```
+
+### Batch mode
+
+`--batch` walks a directory (recursively), expands a glob, or takes one file, and
+prints a single table sorted by risk score: score, level, file name, and a
+one-line judgement taken from the sharpest signal in the file's report.
+
+```
+$ python xray.py --batch C:\Windows\System32 --max-files 50
+SCORE  LEVEL    FILE                                      VERDICT
+------------------------------------------------------------------------------------------------
+   27  low      AcXtrnal.dll                              64-bit DLL: can write/inject code into another process (Que...
+   25  low      accessibilitycpl.dll                      64-bit DLL: reads keyboard state (GetKeyState)
+   25  low      AcSpecfc.dll                              64-bit DLL: talks to the service control manager
+    3  minimal  aadtb.dll                                 64-bit DLL: 1 credential-shaped literal(s) in the image
+   14  minimal  aclui.dll                                 64-bit DLL: checks for debuggers/analysis (OutputDebugStrin...
+    5  minimal  acppage.dll                               64-bit DLL: launches commands through the shell (ShellExecu...
+    3  minimal  ACPBackgroundManagerPolicy.dll            64-bit DLL: offensive-tooling marker in strings: lsass.exe
+scanned 50 of 6365 candidate(s)  ·  listed 50  ·  errors 0  ·  18 unreadable dir(s)  ·  --max-files stopped at 50
+```
+
+Note the last row: `ACPBackgroundManagerPolicy.dll` is flagged for carrying the
+literal `lsass.exe`, which a Microsoft policy DLL legitimately does. The tool
+reports what it found; deciding whether that matters is the analyst's job.
+
+How the pieces behave:
+
+* **Extensions**: `.exe .dll .sys .cpl .scr .ocx`, case-insensitive. A file named
+  explicitly (`--batch C:\x\weird.bin`) is analysed anyway; naming one file is a
+  decision, and the analyzer explains itself if the bytes are not a PE.
+* **Order of work**: candidates are taken in path order and `--max-files` caps how
+  many are *analysed*, not how many are listed, so the cap bounds the run time.
+  The table is then sorted by score, descending.
+* **One line per file**: the verdict column leads with the verdict kind and then
+  the most serious signal. It is clipped, never wrapped.
+* **`--csv`**: same rows, same order, one row per file
+  (`score,level,name,path,verdict`), no ANSI escapes under any `--color` policy.
+  Files that failed to parse come out as `level=error` with an empty score, so a
+  pipeline sees them instead of silently losing them. Unreadable *directories*
+  stay on stderr and in the footer: they are not files.
+* **`--min-risk-level`**: display filter, applied before sorting. The gate below
+  looks at the listed rows, so a CI log never says "gate tripped" while showing
+  nothing that tripped it.
+* **`--fail-on-risk N`**: after rendering, exit `1` when any listed file scores
+  `N` or more (`N` is inclusive; `0` means "anything at all"). Works in batch and
+  single-file mode, which is what a pipeline needs:
+
+  ```powershell
+  python xray.py --batch dist --min-risk-level medium --fail-on-risk 65
+  if ($LASTEXITCODE -eq 1) { throw "release has a high-risk binary" }
+  ```
+* **`--json`**: `{"batch": {…counts…}, "rows": […], "errors": […]}` for anything
+  that would rather parse than scrape the table.
+* **Ctrl+C**: the files analysed so far are rendered before exiting `130`.
+* **Cost**: the analyzer is called once per file and never re-reads it. On this
+  host the first 200 files of `C:\Windows\System32` (6365 candidates) take
+  **53–68 s** across four runs with the default passes, and **7–10 s** with
+  `--no-strings`. The median file costs 61 ms; six 3–6 MB images make up about
+  25 s of the total, so literal extraction — not the checksum, which is skipped
+  by the same flag — is what a directory sweep pays for. Use `--no-strings` (or
+  `--no-checksum`) for a fast first pass over a whole tree.
 
 ## What it reports
 
@@ -115,6 +189,53 @@ because "we could not validate this" must not read as "this looks clean".
 Signature credits are only applied when the signature actually verifies: the tool
 performs RSA PKCS#1 v1.5 verification against the signer certificate, so a
 rewritten `messageDigest` in the certificate table does not buy a file a discount.
+
+### What the packing check can and cannot do
+
+The packing section is a **collection of static evidence**, not an unpacker and
+not an emulator. It sorts evidence into three layers:
+
+* **Identity** — the section names are the packer's own name (`UPX0/UPX1`,
+  `.vmp0/.vmp1`, `.aspack`, `.mpress1`, …) or the packer's magic (`UPX!`). One
+  hit is enough for `likely packed / protected`.
+* **Structure** — properties a normally linked image cannot have but a
+  self-extracting stub must: a writable+executable section that occupies zero
+  bytes on disk and is at least as large as the biggest populated executable
+  section (the unpacking destination — what gets inflated cannot be bigger than
+  what was deflated), an import table reduced to `LoadLibrary` +
+  `GetProcAddress`, section names containing non-printable bytes. One is
+  `possibly`, two are `likely`.
+* **Corroboration** — executable-section entropy above 7.2, entry point outside
+  the first section, RWX sections, overlay, unusually few imports, an empty
+  import table. All of these occur in legitimate software too (measured: the
+  highest executable-section entropy among shipped Windows images is 7.83, while
+  real packer payloads start at 7.34 — **the ranges overlap**; `ntdll.dll` and
+  VirtualBox have no ordinary import table either), so **no single one of them
+  can convict a file**.
+
+Known boundaries:
+
+* Managed (.NET) assemblies are excluded from the judgement: their code entropy
+  and import table are dictated by the CLR. Managed protectors (ConfuserEx and
+  friends) are out of scope entirely.
+* A custom crypter that renames its sections, keeps an ordinary import table and
+  drops its payload into an initialised executable section tops out at
+  "possibly packed".
+* VMProtect/Themida virtualised sections can sit below 7.2 entropy; those are
+  caught by section name, not by entropy.
+* The tool answers "does this file carry packing traces", never "is the code
+  original" and never "is this malware". Those two need unpacking or dynamic
+  analysis.
+
+Real-sample validation (4,166 Windows-supplied images plus 1,491 third-party
+`*.exe` on the author's machine): 3 real packers (UPX ×2, VMProtect ×1) all came
+out `likely packed / protected`; Windows-supplied images produced **zero** false
+positives, and the third-party set produced one remaining `possibly` (an OEM
+managed program with a rewritten PE header). The full investigation — sample
+table, every false positive with its cause, and the measured justification for
+each weight — lives in [NOTES-packing.md](NOTES-packing.md). Regression tests are
+in `tests/test_packing.py` and **skip** on hosts without those samples; a skip
+means "not verified here", never "verified fine".
 
 ## Example
 
@@ -300,9 +421,10 @@ exe_xray/authenticode.py PKCS#7 SignedData walk + Authenticode file digest check
 exe_xray/strings.py      literal extraction + classification
 exe_xray/capabilities.py import table -> capability table
 exe_xray/analyze.py      pipeline, packing heuristics, risk scoring, verdict
-exe_xray/report.py       human / JSON / compact rendering
+exe_xray/report.py       human / JSON / compact / batch-table rendering
 tests/make_fixtures.py   builds synthetic PE fixtures (no compiler involved)
 tests/test_xray.py       unittest suite
+tests/test_batch.py      unittest suite for --batch (discovery, table, CSV, exit codes)
 ```
 
 ## Tests
@@ -318,11 +440,14 @@ products, not checked-in samples, so a fresh clone has no `tests/fixtures/` unti
 the test command above has run once. `python tests/make_fixtures.py` does the
 same without running the tests.
 
-32 tests cover header parsing, import classification, string buckets, packing,
+67 tests cover header parsing, import classification, string buckets, packing,
 risk scoring, error handling, both renderers, the CLI exit codes, the batch
 checksum against the old byte-loop oracle, the `--no-checksum` report marker,
-and — when the files exist on the machine — real `notepad.exe` and a signed
-`python.exe`.
+`--batch` (recursive discovery, extension filter, globs, `--max-files`,
+`--min-risk-level`, table and CSV shape, the `--fail-on-risk` gate in both
+directories and single files, one broken file not ending a sweep, and Ctrl+C
+printing partial results), and — when the files exist on the machine — real
+`notepad.exe` and a signed `python.exe`.
 
 Three notes about deliberate test design:
 

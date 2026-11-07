@@ -34,6 +34,7 @@ for path in (ROOT, HERE):
 import make_fixtures  # noqa: E402
 
 from exe_xray.analyze import AnalysisError, analyze  # noqa: E402
+from exe_xray import strings as S  # noqa: E402
 from exe_xray.authenticode import inspect_signature  # noqa: E402
 from exe_xray.cli import main  # noqa: E402
 from exe_xray.pe import PE, checksum_verification  # noqa: E402
@@ -597,6 +598,166 @@ class TestForgeryRegression(unittest.TestCase):
 
     def test_signed_attribute_rewrite_is_detected(self) -> None:
         self._assert_not_trusted("attrs")
+
+
+class TestExfilHostNames(unittest.TestCase):
+    """The exfil table must match a *host*, never a word inside one.
+
+    ``aadtb.dll`` — a Microsoft system DLL — scored 18/100 because the bare
+    alternative ``requestbin`` matched ``DefaultUser::RequestBindingInfo``. One
+    false positive put it fourth out of 6365 files in a batch sweep. Every entry
+    now carries its TLD and is guarded on both sides, so these cases are the
+    contract: hosts are still caught, lookalike words are not.
+    """
+
+    POSITIVES = (
+        "https://discord.com/api/webhooks/123/abc",
+        "https://discordapp.com/api/webhooks/1/x",
+        "https://ptb.discord.com/api/webhooks/1/x",
+        "https://canary.discord.com/api/webhooks/1/x",
+        "https://api.telegram.org/bot1234:AAE/getUpdates",
+        "https://hooks.slack.com/services/T000/B000/xyz",
+        "https://webhook.site/abc-123",
+        "https://requestbin.com/r/abc",
+        "https://requestbin.net/r/abc",
+        "https://requestbin.io/r/abc",
+        "https://x.m.pipedream.net/post",
+        "https://transfer.sh/abc/file.7z",
+        "https://anonfiles.com/abc",
+        "https://gofile.io/d/abc",
+        "https://0x0.st/abc",
+        "https://termbin.com/xyz",
+    )
+
+    NEGATIVES = (
+        "DefaultUser::RequestBindingInfo",   # the false positive that started this
+        # AppMon.dll: "transfer.sh" used to match inside a WinRT type name and
+        # scored the DLL 9/100 for an exfiltration endpoint it does not have.
+        "Windows.ApplicationModel.DataTransfer.SharedStorageAccessManager",
+        "RequestBin",                        # bare service word, no TLD
+        "requestbin",
+        "termbin",
+        "anonfiles",
+        "termbin-like",
+        "xrequestbin.com",                   # glued to a longer word
+        "evil-requestbin.com",               # hyphen-joined
+        "requestbin.com.evil.tld",           # a different host that starts the same
+        "gofile.io.evil.tld",
+        "anonymized",
+        "mytermbin",
+        "pipedreaming",
+        "0x0.stack",
+        r"C:\temp\transfer.sh.txt",
+        "https://notdiscord.com/api/webhooks/1/x",
+    )
+
+    def test_known_exfil_hosts_are_still_caught(self) -> None:
+        for text in self.POSITIVES:
+            with self.subTest(text=text):
+                self.assertIsNotNone(S._EXFIL_RE.search(text), text)
+
+    def test_lookalike_words_are_not_caught(self) -> None:
+        for text in self.NEGATIVES:
+            with self.subTest(text=text):
+                self.assertIsNone(S._EXFIL_RE.search(text), text)
+
+    def test_a_trailing_sentence_period_still_matches(self) -> None:
+        self.assertIsNotNone(S._EXFIL_RE.search("upload it to 0x0.st. then delete it"))
+
+    def test_classify_puts_the_host_in_the_exfil_bucket(self) -> None:
+        buckets = S.classify(["POST /r/abc HTTP/1.1 to https://requestbin.com/r/abc"])
+        self.assertIn("exfil", buckets)
+
+    def test_classify_does_not_bucket_the_binding_info_identifier(self) -> None:
+        buckets = S.classify(["DefaultUser::RequestBindingInfo"])
+        self.assertNotIn("exfil", buckets)
+
+
+AADTB = r"C:\Windows\System32\aadtb.dll"
+
+
+class TestRealBinaryIsNotAnExfilClient(unittest.TestCase):
+    """Regression on the actual file, when the host has it.
+
+    Not a synthetic stand-in: this is the DLL from the batch sweep whose top
+    signal read "hard-coded exfiltration endpoint: DefaultUser::RequestBindingInfo".
+    """
+
+    @unittest.skipUnless(os.path.exists(AADTB), f"needs {AADTB}")
+    def test_no_exfiltration_endpoint_signal(self) -> None:
+        report = analyze(AADTB)
+        self.assertNotIn("exfil", report["strings"]["by_category"])
+        signal_ids = [s["id"] for s in report["risk"]["signals"]]
+        self.assertNotIn("exfil-endpoint", signal_ids)
+        self.assertNotIn("exfiltration endpoint", report["verdict"]["summary"])
+
+
+class TestToolingTokens(unittest.TestCase):
+    """Same audit for ``_TOOLING_RE``: brand tokens stay, ambiguous words narrow.
+
+    ``reflective`` and ``meterp`` were the two loose ones; the former is ordinary
+    English, the latter is a prefix of "parameter". Both are now tied to the
+    artefact that makes them meaningful.
+    """
+
+    POSITIVES = (
+        "mimikatz.exe",
+        "Invoke-Mimikatz -DumpCreds",
+        "meterpreter",
+        "meterpreter.exe",
+        "meterp.exe",
+        "CobaltStrike beacon",
+        "sekurlsa::logonpasswords",
+        r"C:\Windows\System32\lsass.exe",
+        "ReflectiveLoader",          # the export name the old pattern could not match
+        "reflective loader",
+        "reflective_dll",
+        "shellcode",
+        "psexec.exe",
+        "ngrok.exe",
+        "chisel.exe",
+        "chisel_windows_amd64",
+        "frp.exe",
+        "frpc.exe",
+        "frps.exe",
+        "https://pastebin.com/raw/abc",
+        "http://abcdefg.onion/",
+        "https://discord.com/api/webhooks/1/x",
+        "https://api.telegram.org/bot1:x/getMe",
+    )
+
+    NEGATIVES = (
+        "addParameterProcessor",             # para-meterp-rocessor
+        "get_strOutgoingParameterProblem",
+        "meterp",
+        "reflective UI rendering",           # ordinary English
+        "reflective surfaces",
+        "beacon.dll.mui",                    # resource of a DLL, not the DLL
+        "frpx.exe",
+        "chisel tip",
+        "xfrps.exe",
+        ".onion",                            # a TLD needs a label in front
+        "xmimikatz",
+        "ngroking",
+    )
+
+    def test_offensive_tooling_markers_are_still_caught(self) -> None:
+        for text in self.POSITIVES:
+            with self.subTest(text=text):
+                self.assertIsNotNone(S._TOOLING_RE.search(text), text)
+
+    def test_ambiguous_words_are_not_caught(self) -> None:
+        for text in self.NEGATIVES:
+            with self.subTest(text=text):
+                self.assertIsNone(S._TOOLING_RE.search(text), text)
+
+    def test_classify_keeps_the_tooling_bucket_for_a_real_marker(self) -> None:
+        buckets = S.classify(["dropper: reflective loader + shellcode"])
+        self.assertIn("tooling", buckets)
+
+    def test_classify_does_not_bucket_parameter_identifiers(self) -> None:
+        buckets = S.classify(["addParameterProcessor(get_strOutgoingParameterProblem)"])
+        self.assertNotIn("tooling", buckets)
 
 
 if __name__ == "__main__":

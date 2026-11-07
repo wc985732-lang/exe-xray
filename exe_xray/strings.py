@@ -131,15 +131,59 @@ _B64_RE = re.compile(r"^[A-Za-z0-9+/]{64,}={0,2}$")
 _WALLET_RE = re.compile(
     r"\b(?:bc1[a-z0-9]{25,60}|0x[a-fA-F0-9]{40}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b")
 _TOOLING_RE = re.compile(
-    r"(?i)\b(?:mimikatz|meterpreter|cobaltstrike|beacon\.dll|sekurlsa|lsass\.exe|"
-    r"reflective|msfvenom|shellcode|meterp|psexec|ngrok|chisel|frp[A-Z]?\.exe|"
-    r"discord(?:app)?\.com/api/webhooks|api\.telegram\.org/bot|pastebin\.com/raw|"
-    r"\.onion\b)")
+    r"(?i)(?:"
+    # Unambiguous brand/module tokens. \b stops "xmimikatz" and "mimikatzfoo";
+    # none of these words mean anything else in software.
+    r"\b(?:mimikatz|meterpreter|cobaltstrike|sekurlsa|msfvenom|psexec|ngrok)\b"
+    # Image and module names, with a guard so "beacon.dll.mui" (a resource of the
+    # same name) does not count as the real thing.
+    r"|\bbeacon\.dll(?!\.)"
+    r"|\blsass\.exe\b"
+    # Narrowed on purpose: bare "reflective" is ordinary English and matched
+    # prose, while the old \breflective\b could never match "ReflectiveLoader"
+    # (the \b fails between "e" and "L"). The compounds below catch the real
+    # artefacts and drop the adjective.
+    r"|\breflective[ _-]?(?:loader|load|dll|injection|loadlibrary)\b"
+    r"|\bshellcode\b"
+    # "meterp" alone is a prefix of "parameter": para-meterp-rocessor. The
+    # executable name is the only thing worth matching.
+    r"|\bmeterp(?:reter)?\.exe\b"
+    # "chisel" is also a woodworking word; the released artefacts are these.
+    r"|\bchisel(?:\.exe|_(?:windows|linux|darwin|arm|386|amd64))"
+    # frp[A-Z]?\.exe under re.I matched "frpx.exe"; the tunnel binaries are frp/frpc/frps.
+    r"|\bfrp[cs]?\.exe\b"
+    # Same webhook/paste rules as _EXFIL_RE: host-shaped, whole-token guarded.
+    r"|(?<![\w-])(?:discord|discordapp|ptb\.discord|canary\.discord)\.com/api/webhooks(?![\w-])"
+    r"|(?<![\w-])api\.telegram\.org/bot"
+    r"|(?<![\w-])pastebin\.com/raw(?![\w-])"
+    # A hidden service needs a label in front of the TLD.
+    r"|(?<=[\w-])\.onion\b"
+    r")")
 _SWITCH_RE = re.compile(r"(?:^|\s)(?:-[A-Za-z]{1,3}|--[a-z][\w-]{1,20})(?=\s|$)")
+# Every alternative here is a *hostname*, not a word that happens to appear in
+# one: "requestbin" used to match DefaultUser::RequestBin-dingInfo and "termbin"
+# would match any "...TermBin..." identifier. The guards are:
+#   (?<![\w-])  nothing word-like or hyphen-joined directly before the host
+#               (a "." is allowed, so subdomained hosts such as
+#               <id>.m.pipedream.net still match);
+#   (?![\w-])   the host ends here: "gofile.io.evil.tld" is another host;
+#   (?!\.\w)    ...but a trailing dot ("uploaded to 0x0.st.") is just punctuation.
 _EXFIL_RE = re.compile(
-    r"(?i)(?:discord(?:app)?\.com/api/webhooks|api\.telegram\.org/bot|"
-    r"hooks\.slack\.com|webhook\.site|requestbin|pipedream\.net|"
-    r"transfer\.sh|anonfiles|gofile\.io|0x0\.st|termbin)")
+    r"(?i)(?:"
+    # Hosted relays where the *path* is the payload drop.
+    r"(?<![\w-])(?:discord|discordapp|ptb\.discord|canary\.discord)\.com/api/webhooks(?![\w-])"
+    r"|(?<![\w-])api\.telegram\.org/bot"
+    r"|(?<![\w-])hooks\.slack\.com(?![\w-])(?!\.\w)"
+    # Paste / file-drop collectors, each with its own TLD.
+    r"|(?<![\w-])webhook\.site(?![\w-])(?!\.\w)"
+    r"|(?<![\w-])requestbin\.(?:com|net|io)(?![\w-])(?!\.\w)"
+    r"|(?<![\w-])pipedream\.net(?![\w-])(?!\.\w)"
+    r"|(?<![\w-])transfer\.sh(?![\w-])(?!\.\w)"
+    r"|(?<![\w-])anonfiles\.com(?![\w-])(?!\.\w)"
+    r"|(?<![\w-])gofile\.io(?![\w-])(?!\.\w)"
+    r"|(?<![\w-])0x0\.st(?![\w-])(?!\.\w)"
+    r"|(?<![\w-])termbin\.com(?![\w-])(?!\.\w)"
+    r")")
 
 CATEGORY_TITLES = {
     "url": "URLs / endpoints",

@@ -44,7 +44,88 @@ PACKER_SECTION_MARKERS = {
     ".upx": "UPX", ".crypt": "cryptor", ".enc": "cryptor",
 }
 
-SUSPICIOUS_IMPORT_TOTAL = 12
+# --------------------------------------------------------------------------- #
+# packing evidence weights
+# --------------------------------------------------------------------------- #
+#
+# Every number below is a claim about what a piece of evidence *proves*, in three
+# tiers, not a knob tuned until a particular file looked right. The tiers exist
+# because the coefficients were validated against real images on this host (see
+# NOTES-packing.md): every "corroboration" weight below is a signal for which
+# legitimate and packed images measurably overlap, and such a signal must never
+# be able to decide on its own.
+#
+# identity      the file names the tool that produced it. Nothing else in the
+#               world writes a section called 'UPX0' or '.vmp1'; those strings
+#               exist in the packer's own source and nowhere else. One of these
+#               settles the question on its own, hence >= LIKELY_PACKED.
+# structure     a property a normal link-and-go build cannot have and a
+#               self-unpacking stub must have. One of them is worth a look
+#               (POSSIBLY_PACKED) and two of them together are a stub.
+# corroboration measured to overlap between legitimate and packed images, so it
+#               can only tip a score that already has structure behind it.
+
+PACKER_NAME_EVIDENCE = 60          # a section named after the packer itself
+PACKER_MAGIC_EVIDENCE = 30         # the packer's own magic when sections renamed
+UNINITIALISED_CODE_EVIDENCE = 30   # writable+executable section with 0 bytes on disk
+RESOLVER_ONLY_EVIDENCE = 30        # import table reduced to a dynamic resolver
+MUTATED_SECTION_NAME_EVIDENCE = 30  # section name a toolchain cannot emit
+NO_IMPORTS_EVIDENCE = 15           # code with no import table and nothing exported
+CODE_ENTROPY_EVIDENCE = 25         # executable bytes that cannot be x86 code
+ENTRY_NOT_IN_FIRST_EVIDENCE = 15   # entry point outside the first section
+FEW_IMPORTS_EVIDENCE = 15          # import table too small for the image size
+WRITABLE_CODE_EVIDENCE = 10        # section that is both writable and executable
+SPARSE_CODE_EVIDENCE = 10          # code section mostly uninitialised on disk
+OVERLAY_EVIDENCE = 10              # most of the file sits after the last section
+UNNAMED_SECTION_EVIDENCE = 5       # section with no name at all
+
+POSSIBLY_PACKED = 30
+LIKELY_PACKED = 60
+
+# Same 25-export line the risk section already uses to call an image a "library
+# image": a DLL that exports an API surface that large is offering services, and
+# ntdll.dll (2 523 exports, zero imports, talks to the kernel through syscalls)
+# is the extreme case of an image for which an empty import table is normal.
+LIBRARY_EXPORT_FLOOR = 25
+
+# Shannon entropy above which a section cannot be ordinary compiler output.
+# Measured on this host: 3 999 stock Microsoft images (System32 exe+dll with a
+# code section >= 4 KiB) peak at 7.83 bits/byte, median 6.08, p99 6.50; real
+# packer payloads on the same host start at 7.34 and sit at 7.9-8.0. The two
+# ranges overlap, which is why this is corroboration and not structure: raising
+# the constant to separate them would also separate nothing, because there is no
+# gap to sit in. The constant stays at the classic 7.2 and the *weight* carries
+# the honesty.
+ENTROPY_CEILING = 7.2
+
+# "The import table is too small for the image" needs both halves: a small table
+# on a small image is just a small program, so the size floor is what makes the
+# count meaningful.
+FEW_IMPORTS = 12
+FEW_IMPORTS_MIN_IMAGE = 64 * 1024
+
+# A packer needs to reach any API after it has decoded the real program; loading
+# a module and asking it for a symbol is the whole of that mechanism. Both halves
+# present *and* (almost) nothing else in the table is the resolver-stub idiom.
+LOADER_APIS = frozenset({
+    "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW",
+})
+RESOLVER_APIS = frozenset({"GetProcAddress", "GetProcAddressForCaller"})
+# Stub-side bookkeeping that UPX-class compressors import alongside the resolver:
+# memory protection for the decoded image, and a way to leave. Their presence
+# does not make the import table anything other than a resolver.
+STUB_TOLERATED_APIS = frozenset({
+    "VirtualProtect", "VirtualAlloc", "VirtualFree", "ExitProcess",
+    "TerminateProcess", "GetModuleHandleA", "GetModuleHandleW",
+})
+
+# Images that carry their own loader legitimately have no import table; the
+# Windows boot manager (winload.exe), the hypervisor and the kernel all read as
+# "0 imports" and none of them is packed.
+SELF_LOADING_SUBSYSTEMS = frozenset({
+    "native", "windows-boot-driver", "windows-boot-application",
+    "efi-application", "efi-boot-driver", "efi-runtime-driver",
+})
 
 # Positive evidence is evidence too. A cryptographically verified signature and a
 # stock Microsoft component location are reasons *not* to shout, so they come off
@@ -355,62 +436,228 @@ def _string_facts(pe: PE, max_strings: int, min_len: int) -> dict[str, Any]:
 # packing
 # --------------------------------------------------------------------------- #
 
+def _is_code(sec: dict[str, Any]) -> bool:
+    """Mapped executable: the section holds bytes the CPU will run."""
+    return "X" in sec["flags"]
+
+
+def _printable_section_name(name: str) -> bool:
+    """Section names are 8 bytes of ASCII chosen by the toolchain.
+
+    '' and '<n>' are this parser's markers for a name that was not there, which
+    is a different (weaker) observation than a name full of control bytes.
+    """
+    return all(0x20 <= ord(ch) <= 0x7E for ch in name)
+
+
+def _entry_section_index(pe: PE, raw_sections: list[Any]) -> int:
+    """Index of the section that contains AddressOfEntryPoint, or -1."""
+    for index, sec in enumerate(raw_sections):
+        span = max(sec.virtual_size, sec.raw_size, 1)
+        if sec.virtual_address <= pe.entry_point < sec.virtual_address + span:
+            return index
+    return -1
+
+
 def _packing_verdict(pe: PE, sections: list[dict[str, Any]],
                      imports: dict[str, Any]) -> dict[str, Any]:
     score = 0
     reasons: list[str] = []
+    # Credits that come from identity or structure. A verdict needs one of these:
+    # corroboration alone must never be able to call a file packed, however many
+    # of those weak signals happen to line up.
+    structural = 0
 
-    for sec in sections:
-        marker = PACKER_SECTION_MARKERS.get(sec["name"].lower())
-        if marker:
-            score += 40
-            reasons.append(f"section name '{sec['name']}' is the signature of {marker}")
-
-    if b"UPX!" in pe.data[:2_000_000]:
-        score += 30
-        reasons.append("'UPX!' marker found in the image")
-
-    for sec in sections:
-        if sec["raw_size"] >= 4096 and sec["entropy"] > 7.2:
-            score += 20
-            reasons.append(
-                f"section {sec['name']} has entropy {sec['entropy']:.2f} (>7.2 is "
-                f"typical for compressed or encrypted code)")
-        if "X" in sec["flags"] and "W" in sec["flags"]:
-            score += 15
-            reasons.append(f"section {sec['name']} is both writable and executable")
-        if sec["raw_size"] and sec["virtual_size"] > sec["raw_size"] * 4:
-            score += 10
-            reasons.append(
-                f"section {sec['name']} reserves {sec['virtual_size']} bytes but stores "
-                f"only {sec['raw_size']} (self-unpacking stub pattern)")
-        if not sec["name"].strip():
-            score += 5
-            reasons.append("a section has an empty name")
-
-    total_funcs = imports.get("function_count", 0)
+    clr = _safe(pe.dotnet, None) or {}
+    managed = bool(clr.get("present"))
     size = len(pe.data)
-    if total_funcs and total_funcs < SUSPICIOUS_IMPORT_TOTAL and size > 64 * 1024:
-        score += 20
-        reasons.append(f"only {total_funcs} imported functions in a {size // 1024} KiB "
-                       f"image (packers usually resolve APIs at runtime)")
-    if total_funcs == 0 and size > 32 * 1024:
-        score += 25
-        reasons.append("no import table at all")
+    subsystem = pe.subsystem_name
+
+    # -- identity: the file tells us who packed it ----------------------- #
+    families: dict[str, list[str]] = {}
+    for sec in sections:
+        family = PACKER_SECTION_MARKERS.get(sec["name"].lower())
+        if family:
+            families.setdefault(family, []).append(sec["name"])
+    for family, names in families.items():
+        # One credit per packer, not per section: 'UPX0' and 'UPX1' are one
+        # observation seen twice, and summing them let a two-section stub score
+        # 80 points on its own.
+        listing = ", ".join(repr(n) for n in names)
+        score += PACKER_NAME_EVIDENCE
+        structural += 1
+        reasons.append(
+            f"sections named {listing}: only {family} itself uses that name, so the "
+            f"image was produced by {family}")
+
+    if b"UPX!" in pe.data and "UPX" not in families:
+        score += PACKER_MAGIC_EVIDENCE
+        structural += 1
+        reasons.append("the 'UPX!' magic string is present although the sections were "
+                       "renamed around it")
+
+    # -- structure: what a self-unpacking stub must look like ------------ #
+    #
+    # An unpack destination must be big enough to hold the decoded program, and
+    # the decoded program is by definition at least as large as the compressed
+    # body that was expanded into it. So a zero-filled code section only counts
+    # as a destination when it is not smaller than the biggest file-backed code
+    # section: Oracle VirtualBox's single-page `.rwxpg` scratch region is four
+    # kilobytes next to an 800 KiB .text, which cannot become the image.
+    biggest_backed_code = max(
+        [sec["virtual_size"] for sec in sections
+         if _is_code(sec) and sec["raw_size"]] or [0])
+
+    for sec in sections:
+        code = _is_code(sec)
+        writable = "W" in sec["flags"]
+        discardable = "DISCARDABLE" in sec["flags"]
+        if (code and writable and not discardable and sec["virtual_size"]
+                and not sec["raw_size"]
+                and sec["virtual_size"] >= biggest_backed_code):
+            # Writable *and* executable is what makes this different from the
+            # zero-filled padding sections Microsoft's linker emits ('Pad2' in
+            # ntoskrnl.exe and in the Hyper-V hypervisor is executable, read-only
+            # and discardable): a stub has to be able to write the decoded image
+            # into that memory, and a read-only region could only fault.
+            score += UNINITIALISED_CODE_EVIDENCE
+            structural += 1
+            reasons.append(
+                f"section {sec['name']!r} is writable and executable but stores 0 of its "
+                f"{sec['virtual_size']} bytes: memory reserved for code that does not "
+                f"exist on disk yet")
+        elif code and sec["raw_size"] and sec["virtual_size"] > sec["raw_size"] * 4:
+            score += SPARSE_CODE_EVIDENCE
+            reasons.append(
+                f"code section {sec['name']!r} reserves {sec['virtual_size']} bytes but "
+                f"stores {sec['raw_size']}: most of it is written at run time")
+
+    if not managed:
+        funcs = {fn for lib in (_safe(pe.imports, []) or []) for fn in lib.functions}
+        if (funcs & LOADER_APIS and funcs & RESOLVER_APIS
+                and len(funcs) <= FEW_IMPORTS and size >= FEW_IMPORTS_MIN_IMAGE
+                and not funcs - LOADER_APIS - RESOLVER_APIS - STUB_TOLERATED_APIS):
+            score += RESOLVER_ONLY_EVIDENCE
+            structural += 1
+            reasons.append(
+                "the import table is nothing but a dynamic resolver (LoadLibrary + "
+                "GetProcAddress): the program looks every other API up after it has "
+                "decoded itself")
+
+    if managed and not imports.get("dlls"):
+        # Reported, not scored. Microsoft ships managed EXEs with no import table
+        # at all (System32\tzsync.exe), so "a managed EXE must import
+        # mscoree!_CorExeMain" is a habit, not a law, and a loaded-by-a-CLR-host
+        # image looks the same as a rewritten one from the header alone.
+        reasons.append(
+            "this managed image has no import table: a framework EXE normally imports "
+            "mscoree!_CorExeMain, so either it is started by a CLR host or the entry "
+            "path was rewritten, and the headers cannot tell which")
+
+    mutated = [sec["name"] for sec in sections
+               if sec["name"] and not _printable_section_name(sec["name"])]
+    if mutated:
+        score += MUTATED_SECTION_NAME_EVIDENCE
+        structural += 1
+        reasons.append(
+            f"section name {mutated[0]!r} contains non-printable bytes: no linker emits "
+            f"that, the header was rewritten by a tool that does not follow the format")
+
+    # -- corroboration: measured to overlap, so never decisive ----------- #
+    if managed:
+        # Managed IL is high-entropy by construction (token streams, blob heaps)
+        # and a framework image imports exactly one function by CLR convention.
+        # Neither number says anything about packing, so neither is scored; the
+        # note is printed so the reader knows it was considered, not missed.
+        reasons.append("managed image: code entropy and import count are fixed by the "
+                       "CLR convention, so neither is used as packing evidence here")
+    else:
+        hot = [sec for sec in sections
+               if _is_code(sec) and sec["raw_size"] >= 4096
+               and sec["entropy"] > ENTROPY_CEILING]
+        if hot:
+            top = max(hot, key=lambda s: s["entropy"])
+            score += CODE_ENTROPY_EVIDENCE
+            reasons.append(
+                f"executable section {top['name']!r} has entropy {top['entropy']:.2f} "
+                f"bits/byte, above anything compiler output reaches on this host "
+                f"(max 7.83, median 6.08 over 3 999 stock images)")
+
+        total_funcs = imports.get("function_count", 0)
+        has_code = any(_is_code(sec) and sec["raw_size"] for sec in sections)
+        if total_funcs == 0 and size > 32 * 1024:
+            exports = len(_safe(pe.exports, []) or [])
+            if subsystem in SELF_LOADING_SUBSYSTEMS:
+                reasons.append(
+                    f"no import table, which is normal for a {subsystem} image that "
+                    f"carries its own loader")
+            elif not has_code:
+                # 16 of the 21 stock Windows images the old rule flagged were
+                # flagged for having no import table, and most of those are
+                # resource-only DLLs: strings, manifests, ETW metadata. They
+                # import nothing because they never call anything.
+                reasons.append("no import table and no executable section: a "
+                               "resource-only image, which calls nothing")
+            elif exports >= LIBRARY_EXPORT_FLOOR:
+                reasons.append(
+                    f"no import table but {exports} exported functions: a bottom-layer "
+                    f"library such as ntdll.dll, which reaches the kernel through "
+                    f"syscalls instead of imports")
+            else:
+                score += NO_IMPORTS_EVIDENCE
+                reasons.append(
+                    "no import table at all in an image that does contain code and "
+                    "exports almost nothing: either a stub, or a program with its own "
+                    "loader, and the headers cannot tell which")
+        elif total_funcs and total_funcs < FEW_IMPORTS and size >= FEW_IMPORTS_MIN_IMAGE:
+            score += FEW_IMPORTS_EVIDENCE
+            reasons.append(
+                f"only {total_funcs} imported functions in a {size // 1024} KiB image "
+                f"(packers resolve APIs at runtime)")
+
+    for sec in sections:
+        if _is_code(sec) and "W" in sec["flags"]:
+            score += WRITABLE_CODE_EVIDENCE
+            reasons.append(f"section {sec['name']!r} is both writable and executable")
+            break
+
+    entry_index = _entry_section_index(pe, pe.sections)
+    if entry_index > 0:
+        score += ENTRY_NOT_IN_FIRST_EVIDENCE
+        reasons.append(
+            f"the entry point is in section {entry_index} "
+            f"({pe.sections[entry_index].name!r}), not the first: 90% of the images on "
+            f"this host start in section 0 and the exceptions are kernel loaders")
+
+    if any(sec["name"].startswith("<") and sec["name"].endswith(">") for sec in sections):
+        score += UNNAMED_SECTION_EVIDENCE
+        reasons.append("a section has no name at all")
 
     _, overlay = pe.overlay()
     if overlay > size * 0.5 and overlay > 4096:
-        score += 10
+        score += OVERLAY_EVIDENCE
         reasons.append(f"{overlay // 1024} KiB of overlay data after the last section")
 
     score = min(score, 100)
-    if score >= 60:
+    if not structural and score >= POSSIBLY_PACKED:
+        # Corroboration only: the numbers lined up but nothing structural was
+        # found, so the honest answer is that nothing was found. The score is
+        # clamped into the band the verdict names, because a report that prints
+        # "no packing indicators (score 45/100)" coloured like a warning would be
+        # telling two stories at once. This is what keeps genuinely odd but
+        # legitimate images out of the suspect bucket (hvax64.exe: one import,
+        # entry point in the middle section, 30 points of weak signals).
+        reasons.append(
+            "the signals above are corroborating only; there is no structural packer "
+            "evidence, so this image is not called packed")
+        score = min(score, POSSIBLY_PACKED - 1)
+    if structural and score >= LIKELY_PACKED:
         verdict = "likely packed / protected"
-    elif score >= 30:
+    elif structural and score >= POSSIBLY_PACKED:
         verdict = "possibly packed"
     else:
         verdict = "no packing indicators"
-    return {"score": score, "verdict": verdict, "reasons": reasons[:8]}
+    return {"score": score, "verdict": verdict, "reasons": reasons[:10]}
 
 
 # --------------------------------------------------------------------------- #

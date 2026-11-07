@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import sys
-from typing import Any
+from typing import Any, Iterable
 
 
 class Style:
@@ -247,3 +249,111 @@ def render_compact(report: dict[str, Any]) -> str:
             f"risk={risk['level']:<8} {risk['score']:>3}/100  "
             f"packing={report['packing']['score']:>3}  "
             f"{risk['signals'][0]['text'] if risk['signals'] else 'no notable capabilities'}")
+
+
+# --------------------------------------------------------------------------- #
+# batch tables
+# --------------------------------------------------------------------------- #
+
+#: Colour per risk level in the batch table.
+BATCH_LEVEL_COLOR = {"high": "red", "medium": "yellow", "low": "cyan",
+                     "minimal": "green", "error": "red"}
+
+
+def batch_row(report: dict[str, Any]) -> dict[str, Any]:
+    """Flatten one full report into the four columns the batch table shows.
+
+    The one-liner leads with the verdict kind, then the most serious signal:
+    a batch row is a pointer to the file worth opening, not a summary of the
+    whole report. Nothing is recomputed here; every field is copied.
+    """
+    risk = report["risk"]
+    signals = risk.get("signals") or []
+    top = next((s for s in signals if s["level"] in ("high", "warn")), None)
+    if top is None:
+        top = signals[0] if signals else None
+    kind = report["verdict"]["kind"]
+    summary = f"{kind}: {top['text']}" if top else f"{kind}: nothing notable in the import table"
+    return {
+        "path": report["file"]["path"],
+        "name": report["file"]["name"],
+        "score": risk["score"],
+        "level": risk["level"],
+        "verdict": summary,
+    }
+
+
+def _batch_cell(text: str, width: int) -> str:
+    """Collapse whitespace and clip to ``width`` so a row always stays one line."""
+    text = " ".join(str(text).split())
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3].rstrip() + "..."
+
+
+def render_batch_table(rows: Iterable[dict[str, Any]], *, color: bool = False,
+                       width: int = 120) -> str:
+    """Risk-sorted table: score, level, file name, one-line verdict.
+
+    Rows arrive in the order they are printed (the caller sorts). An error row
+    carries ``score=None`` and an ``error`` message instead of a verdict.
+    """
+    s = Style(color)
+    rows = list(rows)
+    if not rows:
+        return s.dim("no file matched --batch and --min-risk-level")
+
+    name_w = min(max([len(row["name"]) for row in rows] + [len("FILE")]), 40)
+    fixed = 5 + 2 + 7 + 2 + name_w + 2
+    verdict_w = max(width - fixed, 24)
+
+    head = f"{'SCORE':>5}  {'LEVEL':<7}  {'FILE':<{name_w}}  VERDICT"
+    out = [s.bold(head), s.dim("-" * (fixed + verdict_w))]
+
+    for row in rows:
+        level = row.get("level", "error")
+        score = row.get("score")
+        score_s = f"{score:>5}" if isinstance(score, int) else f"{'--':>5}"
+        level_s = f"{level:<7}"
+        paint = getattr(s, BATCH_LEVEL_COLOR.get(level, "dim"), s.dim)
+        verdict = row.get("verdict") or row.get("error") or ""
+        out.append(
+            f"{score_s}  {paint(level_s)}  {row['name']:<{name_w}}  "
+            f"{_batch_cell(verdict, verdict_w)}"
+        )
+    return "\n".join(out)
+
+
+def render_batch_csv(rows: Iterable[dict[str, Any]],
+                     *, errors: Iterable[dict[str, str]] = ()) -> str:
+    """Same rows as CSV for pipelines; errors keep the schema with an empty score."""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(["score", "level", "name", "path", "verdict"])
+    for row in rows:
+        writer.writerow([row.get("score", ""), row.get("level", ""), row.get("name", ""),
+                         row.get("path", ""), row.get("verdict", "")])
+    for err in errors:
+        writer.writerow(["", "error", os.path.basename(err.get("path", "")),
+                         err.get("path", ""), err.get("error", "")])
+    return buf.getvalue().rstrip("\n")
+
+
+def render_batch_footer(stats: dict[str, Any], *, color: bool = False) -> str:
+    """One line under the table: what was scanned, listed, filtered and broken."""
+    s = Style(color)
+    parts = [f"scanned {stats.get('analysed', 0)} of {stats.get('candidates', 0)} candidate(s)",
+             f"listed {stats.get('shown', 0)}"]
+    if stats.get("filtered"):
+        parts.append(f"filtered {stats['filtered']} below {stats.get('min_risk_level', 'minimal')}")
+    errors = stats.get("errors", 0)
+    parts.append(s.red(f"errors {errors}") if errors else s.dim("errors 0"))
+    if stats.get("unreadable_dirs"):
+        parts.append(s.dim(f"{stats['unreadable_dirs']} unreadable dir(s)"))
+    if stats.get("truncated"):
+        parts.append(f"--max-files stopped at {stats.get('selected', 0)}")
+    if stats.get("interrupted"):
+        parts.append(s.red("INTERRUPTED"))
+    return "  ·  ".join(parts)
