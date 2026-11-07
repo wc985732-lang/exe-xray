@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import functools
 import os
+import struct
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +39,15 @@ for path in (ROOT, HERE):
 
 from exe_xray.analyze import (  # noqa: E402
     IL_ENTROPY_CEILING,
+    LIKELY_PACKED,
+    MANAGED_IDENTITY_EVIDENCE,
+    MANAGED_IL_ENTROPY_EVIDENCE,
     MANAGED_MARKERS,
+    MANAGED_METADATA_EVIDENCE,
+    MANAGED_RENAME_EVIDENCE,
+    MANAGED_RESOURCE_EVIDENCE,
+    MANAGED_STRING_ENTROPY_EVIDENCE,
+    MANAGED_STRINGS_STRIPPED_EVIDENCE,
     MDEF_RVA_FLOOR,
     POSSIBLY_PACKED,
     USER_STRING_ENTROPY_CEILING,
@@ -47,6 +57,8 @@ from exe_xray.analyze import (  # noqa: E402
     analyze,
 )
 from exe_xray.pe import PE  # noqa: E402
+
+import make_fixtures  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # vocabulary the verdict must stay inside
@@ -470,6 +482,425 @@ class TestMarkerFamilies(unittest.TestCase):
         for needle, family in MANAGED_MARKERS:
             with self.subTest(family=family, needle=needle):
                 self.assertIn(family, _managed_marker_families(b"x" + needle + b"x"))
+
+
+# --------------------------------------------------------------------------- #
+# 7. the positive path: synthetic CLR images built to trip one rule each
+# --------------------------------------------------------------------------- #
+#
+# Everything above proves the rules stay quiet. None of it proves they can speak:
+# with a score that is always zero, "detects protectors" is an untested claim,
+# and every weight in analyze.py:170-190 is dead code until something trips it.
+#
+# The images below are hand-assembled -- no compiler, no protector, nothing
+# executed -- but structurally real: a BSJB metadata root, a '#~' table stream
+# carrying Module/TypeDef/MethodDef, a '#Strings' heap, and method bodies at
+# addresses the MethodDef RVA column actually points at. Only the *content* is
+# chosen, and each builder flag makes exactly one measured property true, so a
+# test can name the rule that fired and the number it produced.
+#
+# Caveat worth stating in the test rather than in a report: these prove the
+# scoring paths are reachable and calibrated. They are not evidence that a real
+# ConfuserEx build looks like this; the corpus in section 1 covers the other
+# direction.
+
+CLR_V2_VERSION = b"v4.0.30319\x00\x00"
+TINY_BODY_LIMIT = 63          # largest IL a tiny header's size field can address
+BODY_SLOT = 0x80              # room per method body inside the CLR section
+BROKEN_RVA = 0x00F00000       # far outside any section this fixture declares
+
+
+def _pad_to(buffer: bytearray, alignment: int) -> None:
+    buffer += b"\x00" * ((-len(buffer)) % alignment)
+
+
+def _string_heap(names: list[str]) -> tuple[bytes, dict[str, int]]:
+    """A '#Strings' heap: one NUL-led blob of NUL-terminated UTF-8."""
+    heap = bytearray(b"\x00")
+    index: dict[str, int] = {}
+    for name in names:
+        index[name] = len(heap)
+        heap += name.encode("utf-8") + b"\x00"
+    return bytes(heap), index
+
+
+def _table_stream(rows: list[tuple[int, list[bytes]]]) -> bytes:
+    """A '#~' table stream: header, row counts in table order, then the rows."""
+    valid = 0
+    for table, _rows in rows:
+        valid |= 1 << table
+    head = struct.pack("<IBBBBQQ", 0, 2, 0, 0, 0, valid, 0)
+    counts = b"".join(struct.pack("<I", len(table_rows)) for _t, table_rows in rows)
+    body = b"".join(b"".join(table_rows) for _t, table_rows in rows)
+    return head + counts + body
+
+
+def _metadata_root(streams: list[tuple[str, bytes]]) -> bytes:
+    """A metadata root: 'BSJB', version, then stream headers and stream bytes."""
+    head = bytearray(b"BSJB" + struct.pack("<HHI", 1, 1, 0))
+    head += struct.pack("<I", len(CLR_V2_VERSION)) + CLR_V2_VERSION
+    head += struct.pack("<HH", 0, len(streams))
+    header_size = sum(8 + ((len(name) + 4) & ~3) for name, _payload in streams)
+    body = bytearray()
+    placed: list[tuple[int, int]] = []
+    for _name, payload in streams:
+        while (len(head) + header_size + len(body)) % 4:
+            body += b"\x00"
+        placed.append((len(head) + header_size + len(body), len(payload)))
+        body += payload
+    headers = bytearray()
+    for (offset, size), (name, _payload) in zip(placed, streams):
+        headers += struct.pack("<II", offset, size)
+        headers += name.encode("ascii").ljust((len(name) + 4) & ~3, b"\x00")
+    return bytes(head + headers + body)
+
+
+def _method_body(il: bytes) -> bytes:
+    """One method body: tiny header when it fits, fat header when it does not."""
+    if len(il) <= TINY_BODY_LIMIT:
+        return bytes([(len(il) << 2) | 2]) + il
+    return struct.pack("<HHII", 0x3003, 8, len(il), 0) + il
+
+
+def _managed_image(
+    *,
+    methods: int = 8,
+    method_prefix: str = "m",
+    marker: str = "",
+    marker_wide: bool = False,
+    control_names: bool = False,
+    broken_rvas: bool = False,
+    il: bytes = b"\x00\x2a",
+    user_strings: bytes | None = b"\x00\x08Hello\x00",
+    resource_blob: bytes | None = None,
+    resource_name: str = "payload.bin",
+) -> bytes:
+    """A CLR image whose score is decided by the flags, never by luck.
+
+    ``marker`` lands in the '#Strings' heap, which is where a protector's custom
+    attribute name really sits; ``marker_wide`` puts it in the native stub as
+    UTF-16LE instead. ``control_names`` prefixes every identifier with 0x01.
+    ``broken_rvas`` points the MethodDef RVA column at an address no section
+    covers. ``resource_blob`` is embedded verbatim after its four-byte length
+    prefix, so its first four bytes decide the resource kind.
+    """
+    text = b"\x90" * 0x400
+    clr_rva = 0x1000 + ((len(text) + 0xFFF) & ~0xFFF)
+
+    method_names = []
+    for index in range(methods):
+        leaf = f"{method_prefix}{index:04d}"
+        method_names.append(f"\x01{leaf}" if control_names else leaf)
+    heap_names = ["Synthetic.Net.dll", "Program"] + method_names
+    if marker and not marker_wide:
+        heap_names.append(marker)
+    if resource_blob is not None:
+        heap_names.append(resource_name)
+    strings, names = _string_heap(heap_names)
+
+    def streams(rva_of) -> list[tuple[str, bytes]]:
+        module = struct.pack("<HHHHH", 0, names["Synthetic.Net.dll"], 1, 0, 0)
+        typedef = struct.pack("<IHHHHH", 0x100001, names["Program"], 0, 0, 1, 1)
+        method_rows = [
+            struct.pack("<IHHHH", rva_of(index), 0, 0x86, names[method_names[index]], 1)
+            for index in range(methods)
+        ]
+        rows: list[tuple[int, list[bytes]]] = [
+            (0x00, [module]), (0x02, [typedef]), (0x06, method_rows),
+        ]
+        if resource_blob is not None:
+            rows.append((0x28, [struct.pack("<IIHH", 0, 0, names[resource_name], 0)]))
+        parts: list[tuple[str, bytes]] = [
+            ("#~", _table_stream(rows)), ("#Strings", strings), ("#GUID", b"\x00" * 16),
+        ]
+        if user_strings is not None:
+            parts.append(("#US", user_strings))
+        parts.append(("#Blob", b"\x00"))
+        return parts
+
+    # Pass one: geometry only. Row widths are fixed, so the metadata length does
+    # not depend on the RVA values it carries.
+    probe = _metadata_root(streams(lambda _index: 0))
+    body = _method_body(il)
+    slot = max(BODY_SLOT, (len(body) + 0xF) & ~0xF)   # a fat body needs the room
+    body_base = 0x80 + len(probe)
+    body_base += (-body_base) % 0x100
+    resources_base = body_base + methods * slot
+
+    def rva_of(index: int) -> int:
+        return BROKEN_RVA if broken_rvas else clr_rva + body_base + index * slot
+
+    metadata = _metadata_root(streams(rva_of))
+    if len(metadata) != len(probe):
+        raise AssertionError("metadata length depends on RVA values; geometry pass is wrong")
+
+    payload = bytearray(0x80) + bytearray(metadata)
+    _pad_to(payload, 0x100)
+    if len(payload) != body_base:
+        raise AssertionError("body area is not where the pass-one geometry put it")
+    for index in range(methods):
+        cell = bytearray(body)
+        cell += b"\x00" * (slot - len(cell))
+        payload += cell
+    if resource_blob is not None:
+        _pad_to(payload, 0x10)
+        if len(payload) != resources_base:
+            raise AssertionError("resource area is not where the geometry put it")
+        payload += struct.pack("<I", len(resource_blob)) + resource_blob
+    if marker and marker_wide:
+        _pad_to(payload, 4)
+        payload += marker.encode("utf-16-le")
+
+    struct.pack_into("<IHHIIII", payload, 0, 72, 2, 5,
+                     clr_rva + 0x80, len(metadata), 1, 0x06000001)
+    if resource_blob is not None:
+        struct.pack_into("<I", payload, 24, clr_rva + resources_base)
+
+    return make_fixtures.build_pe(
+        subsystem=3,
+        imports={},
+        sections=[(".text", text, make_fixtures.CODE_X_R),
+                  ("clr", bytes(payload), make_fixtures.DATA_R)],
+        entry_section=0,
+        clr_section=1,
+    )
+
+
+def _verdict_for(data: bytes) -> dict:
+    """The managed verdict for a synthetic image, via a real file on disk."""
+    handle, path = tempfile.mkstemp(suffix=".exe", prefix="xray-managed-")
+    try:
+        with os.fdopen(handle, "wb") as fh:
+            fh.write(data)
+        return analyze(path, skip_strings=True)["managed"]
+    finally:
+        os.unlink(path)
+
+
+def _facts_for(data: bytes) -> dict:
+    return _clr_metadata(PE(data, "<synthetic>"))
+
+
+class TestSyntheticBaseline(unittest.TestCase):
+    """The control: a well-formed synthetic assembly must score zero.
+
+    Without this, every positive test below could be passing because the builder
+    makes *everything* look protected.
+    """
+
+    def test_synthetic_assembly_is_clean(self):
+        managed = _verdict_for(_managed_image(methods=8))
+        self.assertIs(managed["applies"], True)
+        self.assertEqual(managed["score"], 0, managed["reasons"])
+        self.assertEqual(managed["verdict"], CLEAN)
+        self.assertEqual(managed["family"], "")
+        self.assertEqual(managed["reasons"], [])
+
+    def test_synthetic_geometry_is_real(self):
+        """The facts the tests then reason about: 8 bodies, all resolvable."""
+        facts = _facts_for(_managed_image(methods=8))
+        self.assertNotIn("error", facts)
+        self.assertEqual(facts["methods"], 8)
+        self.assertEqual(facts["bodies"], 8)
+        self.assertEqual(facts["rva_share"], 1.0)
+        self.assertEqual(facts["module"], "Synthetic.Net.dll")
+        self.assertEqual(facts["table_stream"], "#~")
+        self.assertIn("#Strings", facts["streams"])
+        self.assertEqual(facts["identifiers"], 9)      # Program + 8 methods
+        self.assertEqual(facts["identifiers_control"], 0)
+        self.assertEqual(facts["us_present"], True)
+        self.assertLess(facts["us_entropy"], USER_STRING_ENTROPY_CEILING)
+
+
+class TestIdentityEvidence(unittest.TestCase):
+    """A protector's own name: 60 points, and the verdict band moves."""
+
+    def test_marker_in_the_string_heap_is_identity(self):
+        managed = _verdict_for(_managed_image(methods=8, marker="ConfusedBy"))
+        self.assertEqual(managed["score"], MANAGED_IDENTITY_EVIDENCE)
+        self.assertEqual(managed["family"], "ConfuserEx")
+        self.assertEqual(managed["verdict"], "likely managed protection",
+                         "identity alone clears LIKELY_PACKED")
+        self.assertGreaterEqual(managed["score"], LIKELY_PACKED)
+        joined = " ".join(managed["reasons"])
+        self.assertIn("ConfuserEx", joined)
+        self.assertIn("no compiler emits", joined)
+
+    def test_marker_in_the_native_stub_is_also_identity(self):
+        """The same needle as UTF-16LE, outside the metadata: still 60."""
+        managed = _verdict_for(_managed_image(methods=8, marker=".NET Reactor",
+                                             marker_wide=True))
+        self.assertEqual(managed["score"], MANAGED_IDENTITY_EVIDENCE)
+        self.assertEqual(managed["family"], ".NET Reactor")
+
+    def test_marker_does_not_change_the_structural_facts(self):
+        """Identity is a name, not a shape: the metadata still reads normal."""
+        facts = _facts_for(_managed_image(methods=8, marker="Eazfuscator"))
+        self.assertEqual(facts["rva_share"], 1.0)
+        self.assertEqual(facts["identifiers_control"], 0)
+
+
+class TestStructuralEvidence(unittest.TestCase):
+    """Properties a compiler cannot produce: 30 points each, either alone decides."""
+
+    def test_control_characters_in_identifiers(self):
+        managed = _verdict_for(_managed_image(methods=12, control_names=True))
+        self.assertEqual(managed["score"], MANAGED_RENAME_EVIDENCE)
+        self.assertEqual(managed["verdict"], "possibly managed protection")
+        # Every method is mangled; only the type name ("Program") is still text.
+        self.assertEqual(managed["identifiers_control"], managed["identifiers"] - 1)
+        joined = " ".join(managed["reasons"])
+        self.assertIn("control", joined)
+        self.assertIn("renamer", joined)
+
+    def test_method_rvas_outside_every_section(self):
+        managed = _verdict_for(_managed_image(methods=20, broken_rvas=True))
+        self.assertEqual(managed["score"], MANAGED_METADATA_EVIDENCE)
+        self.assertEqual(managed["verdict"], "possibly managed protection")
+        # Not exactly 0.0: the width probe may still find a stray column whose
+        # bytes happen to land in a section. The rule only asks for "most of them
+        # do not resolve", and that is what it must be held to.
+        self.assertLess(managed["rva_share"], MDEF_RVA_FLOOR)
+        self.assertEqual(managed["methods"], 20)
+        joined = " ".join(managed["reasons"])
+        self.assertIn("RVA column", joined)
+
+    def test_two_structural_findings_from_different_sources_add_up(self):
+        """A renamer and a broken method table are independent: 60 together.
+
+        They cannot be combined on *one* image this small -- once the row width
+        probe picks the wrong stride, the name column it reads is noise, so the
+        rename rule stops seeing control characters (measured: 3 of 9). Identity
+        is the honest partner for this one.
+        """
+        managed = _verdict_for(_managed_image(methods=20, broken_rvas=True,
+                                             marker="Obfuscar"))
+        self.assertEqual(managed["score"],
+                         MANAGED_IDENTITY_EVIDENCE + MANAGED_METADATA_EVIDENCE)
+        self.assertEqual(managed["verdict"], "likely managed protection")
+
+    def test_identity_plus_structure_reaches_ninety(self):
+        managed = _verdict_for(_managed_image(methods=20, marker="ConfusedBy",
+                                             control_names=True))
+        self.assertEqual(managed["score"],
+                         MANAGED_IDENTITY_EVIDENCE + MANAGED_RENAME_EVIDENCE)
+        self.assertEqual(managed["verdict"], "likely managed protection")
+
+
+class TestCorroborationOnly(unittest.TestCase):
+    """The measured-overlap signals: they may tip a score, never make one.
+
+    analyze.py:1239-1249 zeroes the score unless identity or structure decided,
+    and says so in the reasons. These tests pin both halves of that rule.
+    """
+
+    def test_unrecognised_resource_alone_scores_zero(self):
+        managed = _verdict_for(_managed_image(
+            methods=8, resource_blob=b"\x1f\x8b\x08\x00not-a-dotnet-resource"))
+        self.assertIn("unrecognised", managed["resource_kinds"])
+        self.assertEqual(managed["score"], 0, "corroboration must not survive alone")
+        self.assertEqual(managed["verdict"], CLEAN)
+        joined = " ".join(managed["reasons"])
+        self.assertIn("does not start with the .NET resource magic", joined)
+        self.assertIn("corroborating only", joined)
+
+    def test_high_entropy_il_alone_scores_zero(self):
+        noisy = bytes((index * 71 + 13) % 256 for index in range(400))
+        managed = _verdict_for(_managed_image(methods=20, il=noisy))
+        self.assertIsNotNone(managed["il_entropy"])
+        self.assertGreater(managed["il_entropy"], IL_ENTROPY_CEILING)
+        self.assertEqual(managed["score"], 0)
+        self.assertEqual(managed["verdict"], CLEAN)
+
+    def test_ciphertext_string_heap_alone_scores_zero(self):
+        managed = _verdict_for(_managed_image(
+            methods=8, user_strings=bytes(range(256))))
+        self.assertGreater(managed["il_entropy"] or 0, -1)   # IL untouched here
+        self.assertEqual(managed["score"], 0)
+        self.assertEqual(managed["verdict"], CLEAN)
+        joined = " ".join(managed["reasons"])
+        self.assertIn("ciphertext", joined)
+
+    def test_missing_string_heap_alone_scores_zero(self):
+        """200 methods and no #US: 10 points of corroboration, no verdict."""
+        managed = _verdict_for(_managed_image(methods=200, user_strings=None))
+        self.assertEqual(managed["methods"], 200)
+        self.assertEqual(managed["score"], 0)
+        self.assertEqual(managed["verdict"], CLEAN)
+        joined = " ".join(managed["reasons"])
+        self.assertIn("not one string literal", joined)
+
+    def test_corroboration_stacks_on_identity(self):
+        """Resource + ciphertext-string + stripped-heap weights, all on one image."""
+        noise = bytes((index * 71 + 13) % 256 for index in range(400))
+        managed = _verdict_for(_managed_image(
+            methods=200, marker="ConfusedBy", il=noise, user_strings=None,
+            resource_blob=b"\x1f\x8b\x08\x00not-a-dotnet-resource"))
+        expected = (MANAGED_IDENTITY_EVIDENCE + MANAGED_RESOURCE_EVIDENCE
+                    + MANAGED_IL_ENTROPY_EVIDENCE
+                    + MANAGED_STRINGS_STRIPPED_EVIDENCE)
+        self.assertEqual(managed["score"], expected, managed["reasons"])
+        self.assertEqual(managed["verdict"], "likely managed protection")
+        self.assertEqual(managed["family"], "ConfuserEx")
+
+    def test_every_documented_weight_is_reachable(self):
+        """No weight in analyze.py:170-190 is dead: each has a test that fires it."""
+        noisy = bytes((index * 71 + 13) % 256 for index in range(400))
+        fired = {}
+        fired["identity"] = _verdict_for(_managed_image(methods=8, marker="Obfuscar"))
+        fired["rename"] = _verdict_for(_managed_image(methods=12, control_names=True))
+        fired["metadata"] = _verdict_for(_managed_image(
+            methods=20, marker="Obfuscar", broken_rvas=True))
+        fired["resource"] = _verdict_for(_managed_image(
+            methods=8, marker="Obfuscar",
+            resource_blob=b"\x1f\x8b\x08\x00not-a-dotnet-resource"))
+        fired["il_entropy"] = _verdict_for(
+            _managed_image(methods=20, marker="Obfuscar", il=noisy))
+        fired["string_entropy"] = _verdict_for(_managed_image(
+            methods=8, marker="Obfuscar", user_strings=bytes(range(256))))
+        fired["strings_stripped"] = _verdict_for(
+            _managed_image(methods=200, marker="Obfuscar", user_strings=None))
+
+        expected = {
+            "identity": MANAGED_IDENTITY_EVIDENCE,
+            "rename": MANAGED_RENAME_EVIDENCE,
+            "metadata": MANAGED_IDENTITY_EVIDENCE + MANAGED_METADATA_EVIDENCE,
+            "resource": MANAGED_IDENTITY_EVIDENCE + MANAGED_RESOURCE_EVIDENCE,
+            "il_entropy": MANAGED_IDENTITY_EVIDENCE + MANAGED_IL_ENTROPY_EVIDENCE,
+            "string_entropy": MANAGED_IDENTITY_EVIDENCE + MANAGED_STRING_ENTROPY_EVIDENCE,
+            "strings_stripped": (MANAGED_IDENTITY_EVIDENCE
+                                 + MANAGED_STRINGS_STRIPPED_EVIDENCE),
+        }
+        for label, managed in fired.items():
+            with self.subTest(weight=label):
+                self.assertEqual(managed["score"], expected[label],
+                                 f"{label}: {managed['reasons']}")
+                self.assertGreaterEqual(managed["score"], POSSIBLY_PACKED)
+        self.assertEqual(fired["resource"]["score"],
+                         MANAGED_IDENTITY_EVIDENCE + MANAGED_RESOURCE_EVIDENCE)
+        self.assertEqual(fired["il_entropy"]["score"],
+                         MANAGED_IDENTITY_EVIDENCE + MANAGED_IL_ENTROPY_EVIDENCE)
+        self.assertEqual(fired["string_entropy"]["score"],
+                         MANAGED_IDENTITY_EVIDENCE + MANAGED_STRING_ENTROPY_EVIDENCE)
+        self.assertEqual(fired["strings_stripped"]["score"],
+                         MANAGED_IDENTITY_EVIDENCE + MANAGED_STRINGS_STRIPPED_EVIDENCE)
+
+
+class TestUnreadableMetadata(unittest.TestCase):
+    """A mangled metadata root is reported, and it is never scored as evidence."""
+
+    def test_broken_bsjb_signature_is_its_own_verdict(self):
+        data = bytearray(_managed_image(methods=8, marker="ConfusedBy"))
+        offset = data.find(b"BSJB")
+        self.assertGreater(offset, 0, "the fixture must carry a metadata root")
+        data[offset:offset + 4] = b"XXXX"
+        managed = _verdict_for(bytes(data))
+        self.assertIs(managed["applies"], True)
+        self.assertEqual(managed["verdict"], "managed metadata unreadable")
+        self.assertEqual(managed["score"], 0,
+                         "unreadable metadata is a finding, not evidence: no points")
+        joined = " ".join(managed["reasons"])
+        self.assertIn("could not be read", joined)
 
 
 if __name__ == "__main__":
