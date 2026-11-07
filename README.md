@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml/badge.svg)](https://github.com/wc985732-lang/exe-xray/actions/workflows/tests.yml)
 
-English | [简体中文](README.zh-CN.md)
+English | [简体中文](https://github.com/wc985732-lang/exe-xray/blob/main/README.zh-CN.md)
 
 A static, human-readable health check for Windows executables.
 
@@ -235,7 +235,7 @@ out `likely packed / protected`; Windows-supplied images produced **zero** false
 positives, and the third-party set produced one remaining `possibly` (an OEM
 managed program with a rewritten PE header). The full investigation — sample
 table, every false positive with its cause, and the measured justification for
-each weight — lives in [NOTES-packing.md](NOTES-packing.md). Regression tests are
+each weight — lives in [NOTES-packing.md](https://github.com/wc985732-lang/exe-xray/blob/main/NOTES-packing.md). Regression tests are
 in `tests/test_packing.py` and **skip** on hosts without those samples; a skip
 means "not verified here", never "verified fine".
 
@@ -486,4 +486,4 @@ Honest list:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/wc985732-lang/exe-xray/blob/main/LICENSE).

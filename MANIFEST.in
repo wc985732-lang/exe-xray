@@ -1,0 +1,15 @@
+# Files that the sdist ships beyond the package itself.
+#
+# The tests are useful to anyone unpacking the sdist, but they import
+# make_fixtures, so the whole tests/ tree has to travel together. The generated
+# fixtures themselves are build products and are excluded — tests/make_fixtures.py
+# rebuilds them byte for byte on demand.
+graft tests
+prune tests/fixtures
+global-exclude *.py[cod] __pycache__
+
+include README.zh-CN.md
+include CHANGELOG.md
+include NOTES-packing.md
+include NOTES-dotnet.md
+include RELEASING.md
